@@ -1,2 +1,16 @@
+# Secrets
 key.git
+
+# Documentation (per user request)
 *.md
+
+# Dependencies
+node_modules/
+
+# Uploads & Output
+uploads/
+output/
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -478,7 +478,14 @@
 
       // Check overlap with other clips in same track
       const clips = state.timeline.overlayTracks[String(trackIdx)];
-      const overlap = clips.find((c) => c.id !== clip.id && Math.abs(c.timelineStart - newStart) < duration * 0.1);
+      const overlap = clips.find((c) => {
+        if (c.id === clip.id) return false;
+        const otherStart = c.timelineStart || 0;
+        const otherDuration = c.sourceOut - c.sourceIn;
+        const newEnd = newStart + duration;
+        const otherEnd = otherStart + otherDuration;
+        return newStart < otherEnd && otherStart < newEnd;
+      });
 
       if (!overlap) {
         clip.timelineStart = newStart;
@@ -826,8 +833,7 @@
       const y = e.clientY - rect.top;
 
       // Map canvas position to timeline time
-      const scaleX = canvas.width / rect.width;
-      const time = (x * scaleX) / state.pixelPerSecond;
+      const time = (x / canvas.width) * state.totalDuration;
 
       state.playhead = Math.max(0, time);
       renderCanvas();

@@ -391,8 +391,9 @@ function buildOutputArgs(timeline, outVideo = '[outv]', outAudio = '[outa]') {
   return [
     '-map', outVideo,
     '-map', outAudio,
-    '-c:v', 'mpeg4',
-    '-q:v', '5',
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', '23',
     '-c:a', 'aac',
     '-b:a', '128k',
     '-r', String(fps),
@@ -541,7 +542,8 @@ async function runExportJob(jobId, timeline) {
         const clips = overlayTracks[String(trackIdx)];
         if (!clips || clips.length === 0) continue;
 
-        clips.forEach((clip, clipIdx) => {
+        for (let clipIdx = 0; clipIdx < clips.length; clipIdx++) {
+          const clip = clips[clipIdx];
           const inputIndex = inputIndexMap.get(clip.sourceId);
           const duration = clip.sourceOut - (clip.sourceIn || 0);
           const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
@@ -560,17 +562,19 @@ async function runExportJob(jobId, timeline) {
             `[${ovLabel}]format=rgba,colorchannelmixer=aa=${opacity}[${ovFmtLabel}]`
           );
 
+          let overlayInput = `[${ovFmtLabel}]`;
+          if (clipIdx === 0) {
+            overlayInput = `[${outVideo}][${ovFmtLabel}]`;
+          }
+
           const outLabel = clipIdx < clips.length - 1 ? `[ov${trackIdx}_${clipIdx}]` : `[ov${trackIdx}]`;
           filterLines.push(
-            `[${ovFmtLabel}]overlay=enable='between(t,${timelineStart},${end})':x=${x}:y=${y}${outLabel}`
+            `[${overlayInput}]overlay=enable='between(t,${timelineStart},${end})':x=${x}:y=${y}${outLabel}`
           );
-        });
+        }
 
         const lastOvLabel = clips.length === 1 ? `[ov${trackIdx}_0]` : `[ov${trackIdx}]`;
-        filterLines.push(
-          `[${outVideo}][${lastOvLabel}]overlay=x=0:y=0[outv_${trackIdx}]`
-        );
-        outVideo = `[outv_${trackIdx}]`;
+        outVideo = lastOvLabel;
       }
     }
 
