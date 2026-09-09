@@ -318,6 +318,323 @@ async function ensureDir(dirPath) {
   await fsPromises.mkdir(dirPath, { recursive: true });
 }
 
+// ============================================================
+// Phase 3 — Export Pipeline Functions
+// ============================================================
+
+const EXPORT_JOBS = new Map();
+let ffmpegRunning = false;
+
+function buildInputArgs(mediaList, mediaStore) {
+  const seen = new Set();
+  const args = [];
+  const inputIndexMap = new Map();
+  let inputIndex = 0;
+
+  for (const mediaId of mediaList) {
+    if (seen.has(mediaId)) continue;
+    seen.add(mediaId);
+    const media = mediaStore.get(mediaId);
+    if (!media) continue;
+    const filePath = path.join(UPLOAD_DIR, media.filename);
+    args.push('-i', filePath);
+    inputIndexMap.set(mediaId, inputIndex);
+    inputIndex++;
+  }
+
+  return { args, inputIndexMap };
+}
+
+function buildMainFilter(mainTrack, inputIndexMap) {
+  const filterLines = [];
+  const videoLabels = [];
+  const audioLabels = [];
+
+  mainTrack.forEach((clip, i) => {
+    const inputIndex = inputIndexMap.get(clip.sourceId);
+    const sourceIn = clip.sourceIn || 0;
+    const sourceOut = clip.sourceOut;
+
+    filterLines.push(
+      `[${inputIndex}:v]trim=start=${sourceIn}:end=${sourceOut},setpts=PTS-STARTPTS[v${i}]`
+    );
+    filterLines.push(
+      `[${inputIndex}:a]atrim=start=${sourceIn}:end=${sourceOut},asetpts=PTS-STARTPTS[a${i}]`
+    );
+
+    videoLabels.push(`[v${i}]`);
+    audioLabels.push(`[a${i}]`);
+  });
+
+  return { filterLines, videoLabels, audioLabels };
+}
+
+function buildConcatFilter(videoLabels, audioLabels) {
+  const filterLines = [];
+  const numClips = videoLabels.length;
+
+  if (numClips === 1) {
+    // Just use the trimmed streams directly, no filter needed
+    return { filterLines: [], outVideo: videoLabels[0], outAudio: audioLabels[0] };
+  }
+
+  const concatInputs = videoLabels.concat(audioLabels).join('');
+  filterLines.push(
+    `${concatInputs}concat=n=${numClips}:v=1:a=1[outv][outa]`
+  );
+
+  return { filterLines, outVideo: '[outv]', outAudio: '[outa]' };
+}
+
+function buildOutputArgs(timeline, outVideo = '[outv]', outAudio = '[outa]') {
+  const fps = timeline.fps || 30;
+  return [
+    '-map', outVideo,
+    '-map', outAudio,
+    '-c:v', 'mpeg4',
+    '-q:v', '5',
+    '-c:a', 'aac',
+    '-b:a', '128k',
+    '-r', String(fps),
+    '-movflags', '+faststart',
+  ];
+}
+
+function validateTimeline(timeline, mediaStore) {
+  const errors = [];
+  const { mainTrack, overlayTracks, outputWidth, outputHeight } = timeline;
+
+  if (!mainTrack || mainTrack.length === 0) {
+    errors.push('mainTrack must have at least 1 clip');
+  }
+
+  if (!overlayTracks || !overlayTracks['1'] || !overlayTracks['2'] || !overlayTracks['3']) {
+    errors.push('overlayTracks must have keys "1", "2", "3"');
+  }
+
+  if (!Number.isFinite(outputWidth) || outputWidth <= 0 || outputWidth % 2 !== 0) {
+    errors.push('outputWidth must be a positive even number');
+  }
+  if (!Number.isFinite(outputHeight) || outputHeight <= 0 || outputHeight % 2 !== 0) {
+    errors.push('outputHeight must be a positive even number');
+  }
+
+  for (const clip of mainTrack) {
+    const media = mediaStore.get(clip.sourceId);
+    if (!media) {
+      errors.push(`main clip ${clip.id}: sourceId '${clip.sourceId}' not found`);
+      continue;
+    }
+    if (clip.sourceIn >= clip.sourceOut) {
+      errors.push(`main clip ${clip.id}: sourceIn (${clip.sourceIn}) >= sourceOut (${clip.sourceOut})`);
+    }
+    if (clip.sourceOut > media.duration) {
+      errors.push(`main clip ${clip.id}: sourceOut (${clip.sourceOut}) > media duration (${media.duration})`);
+    }
+    if (!media.hasVideo || !media.hasAudio) {
+      errors.push(`main clip ${clip.id}: source media must have both video and audio`);
+    }
+  }
+
+  const totalDuration = mainTrack.reduce((sum, clip) => {
+    return sum + ((clip.sourceOut || 0) - (clip.sourceIn || 0));
+  }, 0);
+
+  for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
+    const clips = overlayTracks[String(trackIdx)];
+    if (!clips || clips.length === 0) continue;
+
+    for (const clip of clips) {
+      const media = mediaStore.get(clip.sourceId);
+      if (!media) {
+        errors.push(`overlay clip ${clip.id} (track ${trackIdx}): sourceId '${clip.sourceId}' not found`);
+        continue;
+      }
+
+      const duration = clip.sourceOut - (clip.sourceIn || 0);
+      const end = (clip.timelineStart || 0) + duration;
+
+      if (clip.trackIndex !== undefined && (clip.trackIndex < 1 || clip.trackIndex > 3)) {
+        errors.push(`overlay clip ${clip.id}: trackIndex must be 1, 2, or 3`);
+      }
+
+      if (duration <= 0) {
+        errors.push(`overlay clip ${clip.id}: duration must be positive`);
+      }
+      if (duration > media.duration) {
+        errors.push(`overlay clip ${clip.id}: duration (${duration}) > media duration (${media.duration})`);
+      }
+      if (end > totalDuration) {
+        errors.push(`overlay clip ${clip.id}: timelineStart + duration (${end}) > total duration (${totalDuration})`);
+      }
+      if (clip.x + clip.width > outputWidth || clip.y + clip.height > outputHeight) {
+        errors.push(`overlay clip ${clip.id}: position + size exceeds output dimensions`);
+      }
+
+      const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
+      if (opacity < 0.0 || opacity > 1.0) {
+        errors.push(`overlay clip ${clip.id}: opacity must be between 0.0 and 1.0`);
+      }
+
+      for (const other of clips) {
+        if (other.id === clip.id) continue;
+        const otherStart = other.timelineStart || 0;
+        const otherEnd = otherStart + (other.sourceOut - (other.sourceIn || 0));
+        const clipStart = clip.timelineStart || 0;
+        const clipEnd = clipStart + duration;
+        if (clipStart < otherEnd && clipEnd > otherStart) {
+          errors.push(`overlay clips ${clip.id} and ${other.id} overlap in track ${trackIdx}`);
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+async function runExportJob(jobId, timeline) {
+  const job = EXPORT_JOBS.get(jobId);
+  if (!job) return;
+
+  job.status = 'running';
+  job.progress = 0.0;
+  saveExportJob(job);
+
+  try {
+    const { mainTrack, overlayTracks, outputWidth, outputHeight, fps } = timeline;
+    const allMediaIds = [...new Set([...mainTrack.map(c => c.sourceId)])];
+
+    for (let t = 1; t <= 3; t++) {
+      const clips = overlayTracks[String(t)];
+      if (clips && clips.length > 0) {
+        clips.forEach(c => {
+          if (!allMediaIds.includes(c.sourceId)) allMediaIds.push(c.sourceId);
+        });
+      }
+    }
+
+    const { args: inputArgs, inputIndexMap } = buildInputArgs(allMediaIds, MEDIA_STORE);
+    const mainResult = buildMainFilter(mainTrack, inputIndexMap);
+
+    const hasOverlays = [1, 2, 3].some(t => {
+      const clips = overlayTracks[String(t)];
+      return clips && clips.length > 0;
+    });
+
+    let filterLines = [...mainResult.filterLines];
+    let outVideo = mainResult.videoLabels[mainResult.videoLabels.length - 1] || '[v0]';
+    let outAudio = mainResult.audioLabels[mainResult.audioLabels.length - 1] || '[a0]';
+
+    if (!hasOverlays) {
+      const concatResult = buildConcatFilter(mainResult.videoLabels, mainResult.audioLabels);
+      filterLines.push(...concatResult.filterLines);
+      outVideo = concatResult.outVideo;
+      outAudio = concatResult.outAudio;
+    } else {
+      const totalDuration = mainTrack.reduce((s, c) => s + ((c.sourceOut || 0) - (c.sourceIn || 0)), 0);
+      const concatResult = buildConcatFilter(mainResult.videoLabels, mainResult.audioLabels);
+      filterLines.push(...concatResult.filterLines);
+      outVideo = concatResult.outVideo;
+      outAudio = concatResult.outAudio;
+
+      for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
+        const clips = overlayTracks[String(trackIdx)];
+        if (!clips || clips.length === 0) continue;
+
+        clips.forEach((clip, clipIdx) => {
+          const inputIndex = inputIndexMap.get(clip.sourceId);
+          const duration = clip.sourceOut - (clip.sourceIn || 0);
+          const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
+          const x = clip.x || 0;
+          const y = clip.y || 0;
+          const timelineStart = clip.timelineStart || 0;
+          const end = timelineStart + duration;
+
+          const ovLabel = `ov${trackIdx}_${clipIdx}`;
+          const ovFmtLabel = `ov${trackIdx}_${clipIdx}_fmt`;
+
+          filterLines.push(
+            `[${inputIndex}:v]trim=start=${clip.sourceIn || 0}:end=${clip.sourceOut},setpts=PTS-STARTPTS[${ovLabel}]`
+          );
+          filterLines.push(
+            `[${ovLabel}]format=rgba,colorchannelmixer=aa=${opacity}[${ovFmtLabel}]`
+          );
+
+          const outLabel = clipIdx < clips.length - 1 ? `[ov${trackIdx}_${clipIdx}]` : `[ov${trackIdx}]`;
+          filterLines.push(
+            `[${ovFmtLabel}]overlay=enable='between(t,${timelineStart},${end})':x=${x}:y=${y}${outLabel}`
+          );
+        });
+
+        const lastOvLabel = clips.length === 1 ? `[ov${trackIdx}_0]` : `[ov${trackIdx}]`;
+        filterLines.push(
+          `[${outVideo}][${lastOvLabel}]overlay=x=0:y=0[outv_${trackIdx}]`
+        );
+        outVideo = `[outv_${trackIdx}]`;
+      }
+    }
+
+    const outputArgs = buildOutputArgs(timeline, outVideo, outAudio);
+    const outputPath = path.join(OUTPUT_DIR, `${jobId}.mp4`);
+
+    const filterComplex = filterLines.join(';');
+    const ffmpegCmd = 'ffmpeg';
+    const ffmpegArgs = [
+      ...inputArgs,
+      '-filter_complex', filterComplex,
+      ...outputArgs,
+      '-y',
+      outputPath,
+    ];
+
+    console.log('[export] ffmpeg args:', ffmpegArgs.join(' '));
+
+    job.ffmpegProcess = execFile(ffmpegCmd, ffmpegArgs, { timeout: 300000 }, (error, stdout, stderr) => {
+      if (error) {
+        console.error('[export] ffmpeg error:', error.message, stderr?.toString() || '');
+        job.status = 'failed';
+        job.error = 'export_failed';
+        job.progress = 1.0;
+        saveExportJob(job);
+        ffmpegRunning = false;
+        return;
+      }
+      job.status = 'done';
+      job.progress = 1.0;
+      job.outputPath = outputPath;
+      saveExportJob(job);
+      ffmpegRunning = false;
+    });
+
+    job.ffmpegProcess.stderr.on('data', (data) => {
+      const str = data.toString();
+      const timeMatch = str.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+      if (timeMatch) {
+        const secs = parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseFloat(timeMatch[3]);
+        job.progress = Math.min(secs / (timeline.duration || 60), 1.0);
+        saveExportJob(job);
+      }
+    });
+  } catch (err) {
+    console.error('[export] runExportJob error:', err);
+    job.status = 'failed';
+    job.error = err.message;
+    job.progress = 1.0;
+    saveExportJob(job);
+    ffmpegRunning = false;
+  }
+}
+
+function saveExportJob(job) {
+  EXPORT_JOBS.set(job.jobId, job);
+  const jsonPath = path.join(OUTPUT_DIR, `${job.jobId}.status.json`);
+  try {
+    fs.writeFileSync(jsonPath, JSON.stringify(job, null, 2));
+  } catch (e) {
+    console.error('Failed to save export job:', e.message);
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const parsedUrl = url.parse(req.url, true);
@@ -475,19 +792,118 @@ const server = http.createServer(async (req, res) => {
 
     // POST /api/export — Phase 3: Start export job
     if (pathname === '/api/export' && req.method === 'POST') {
-      sendJson(res, 501, { error: 'not_implemented', message: 'Export not implemented yet (Phase 3)' });
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        let timeline;
+        try {
+          timeline = JSON.parse(body);
+        } catch (e) {
+          sendJson(res, 400, { errors: ['Invalid JSON in request body'] });
+          return;
+        }
+
+        const validationErrors = validateTimeline(timeline, MEDIA_STORE);
+        if (validationErrors.length > 0) {
+          sendJson(res, 400, { errors: validationErrors });
+          return;
+        }
+
+        if (ffmpegRunning) {
+          sendJson(res, 429, { error: 'busy', message: 'Another export is running' });
+          return;
+        }
+
+        const jobId = 'job_' + crypto.randomUUID().replace(/-/g, '').slice(0, 12);
+        const job = {
+          jobId,
+          status: 'queued',
+          progress: 0.0,
+          outputPath: null,
+          error: null,
+        };
+        EXPORT_JOBS.set(jobId, job);
+        saveExportJob(job);
+
+        ffmpegRunning = true;
+        runExportJob(jobId, timeline);
+
+        sendJson(res, 202, { jobId });
+      });
       return;
     }
 
     // GET /api/export/:jobId/status — Phase 3: Check export status
-    if (pathname.match(/^\/api\/export\/[^/]+\/status$/) && req.method === 'GET') {
-      sendJson(res, 501, { error: 'not_implemented', message: 'Export status not implemented yet (Phase 3)' });
+    const exportStatusMatch = pathname.match(/^\/api\/export\/([^/]+)\/status$/);
+    if (exportStatusMatch && req.method === 'GET') {
+      const jobId = exportStatusMatch[1];
+      const job = EXPORT_JOBS.get(jobId);
+      if (!job) {
+        sendJson(res, 404, { error: 'not_found', message: 'Export job not found' });
+        return;
+      }
+      sendJson(res, 200, {
+        status: job.status,
+        progress: job.progress,
+        error: job.error || null,
+      });
       return;
     }
 
     // GET /api/export/:jobId/download — Phase 3: Download exported file
-    if (pathname.match(/^\/api\/export\/[^/]+\/download$/) && req.method === 'GET') {
-      sendJson(res, 501, { error: 'not_implemented', message: 'Export download not implemented yet (Phase 3)' });
+    const exportDownloadMatch = pathname.match(/^\/api\/export\/([^/]+)\/download$/);
+    if (exportDownloadMatch && req.method === 'GET') {
+      const jobId = exportDownloadMatch[1];
+      const job = EXPORT_JOBS.get(jobId);
+      if (!job || job.status !== 'done' || !job.outputPath) {
+        sendJson(res, 404, { error: 'not_found', message: 'Export file not ready' });
+        return;
+      }
+
+      const filePath = path.join(__dirname, job.outputPath);
+      if (!fs.existsSync(filePath)) {
+        sendJson(res, 404, { error: 'not_found', message: 'Export file not found on disk' });
+        return;
+      }
+
+      const stat = fs.statSync(filePath);
+      const fileSize = stat.size;
+      const range = req.headers['range'];
+
+      if (range) {
+        const rangeMatch = range.match(/bytes=(\d+)-(\d*)/);
+        if (rangeMatch) {
+          const start = parseInt(rangeMatch[1], 10);
+          const end = rangeMatch[2] ? parseInt(rangeMatch[2], 10) : fileSize - 1;
+
+          if (start >= fileSize || start > end) {
+            res.writeHead(416, {
+              'Content-Range': `bytes */${fileSize}`,
+              'Content-Type': 'application/octet-stream',
+            });
+            res.end(JSON.stringify({ error: 'range_not_satisfiable' }));
+            return;
+          }
+
+          const contentLength = end - start + 1;
+          res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': contentLength,
+            'Content-Type': 'video/mp4',
+          });
+
+          fs.createReadStream(filePath, { start, end }).pipe(res);
+          return;
+        }
+      }
+
+      res.writeHead(200, {
+        'Content-Length': fileSize,
+        'Content-Type': 'video/mp4',
+        'Accept-Ranges': 'bytes',
+      });
+      fs.createReadStream(filePath).pipe(res);
       return;
     }
 
