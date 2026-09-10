@@ -358,7 +358,7 @@ function buildInputArgs(mediaList, mediaStore) {
   return { args, inputIndexMap };
 }
 
-function buildTrackFilter(clips, inputIndexMap, trackIndex) {
+function buildTrackFilter(clips, inputIndexMap, trackIndex, outputWidth, outputHeight) {
   const filterLines = [];
   const videoLabels = [];
   const audioLabels = [];
@@ -376,9 +376,18 @@ function buildTrackFilter(clips, inputIndexMap, trackIndex) {
       );
       audioLabels.push(`[a${trackIndex}_${i}]`);
     } else {
-      // Video clip (with audio)
+      // Video clip (with audio). The main track (track 0) fills the whole
+      // output frame, so scale it to the export resolution the same way the
+      // live preview stretches it to fill the canvas. Opacity is baked in
+      // here (via an alpha channel) so it survives concatenation; it's
+      // realized visually later when this track is composited over a black
+      // background plate, since the final H.264/mpeg4 output has no alpha.
+      const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
+      const scaleFilter = (trackIndex === 0 && outputWidth && outputHeight)
+        ? `,scale=${outputWidth}:${outputHeight}`
+        : '';
       filterLines.push(
-        `[${inputIndex}:v]trim=start=${sourceIn}:end=${sourceOut},setpts=PTS-STARTPTS[v${trackIndex}_${i}]`
+        `[${inputIndex}:v]trim=start=${sourceIn}:end=${sourceOut},setpts=PTS-STARTPTS${scaleFilter},format=rgba,colorchannelmixer=aa=${opacity}[v${trackIndex}_${i}]`
       );
       filterLines.push(
         `[${inputIndex}:a]atrim=start=${sourceIn}:end=${sourceOut},asetpts=PTS-STARTPTS[a${trackIndex}_${i}]`
@@ -543,88 +552,92 @@ async function runExportJob(jobId, timeline) {
     const { args: inputArgs, inputIndexMap } = buildInputArgs(mediaIdArray, MEDIA_STORE);
     const filterLines = [];
 
-    // Build filters for each track
-    const trackResults = {};
-    for (let trackIdx = 0; trackIdx <= 3; trackIdx++) {
-      const clips = tracks[String(trackIdx)];
-      if (!clips || clips.length === 0) {
-        trackResults[String(trackIdx)] = { videoLabels: [], audioLabels: [] };
-        continue;
-      }
-      trackResults[String(trackIdx)] = buildTrackFilter(clips, inputIndexMap, trackIdx);
-    }
+    // Build filters for the main track (track 0). Overlay tracks (1-3) are
+    // handled separately below since they need per-clip positioning/timing
+    // rather than a straight concatenation.
+    const track0Result = buildTrackFilter(tracks['0'] || [], inputIndexMap, 0, outputWidth, outputHeight);
+    filterLines.push(...track0Result.filterLines);
 
-    // Start with track 0 (main track)
-    let outVideo = trackResults['0'].videoLabels[trackResults['0'].videoLabels.length - 1] || null;
-    let outAudio = trackResults['0'].audioLabels[trackResults['0'].audioLabels.length - 1] || null;
-    filterLines.push(...trackResults['0'].filterLines);
+    let outVideo = track0Result.videoLabels[track0Result.videoLabels.length - 1] || null;
+    let outAudio = track0Result.audioLabels[track0Result.audioLabels.length - 1] || null;
 
     // Concatenate main track clips if multiple
-    if (trackResults['0'].videoLabels.length > 1 || trackResults['0'].audioLabels.length > 1) {
-      const videoLabels = trackResults['0'].videoLabels.filter(l => l);
-      const audioLabels = trackResults['0'].audioLabels.filter(l => l);
+    if (track0Result.videoLabels.length > 1 || track0Result.audioLabels.length > 1) {
+      const videoLabels = track0Result.videoLabels.filter(l => l);
+      const audioLabels = track0Result.audioLabels.filter(l => l);
       if (videoLabels.length > 0 && audioLabels.length > 0) {
         const concatResult = buildConcatFilter(videoLabels, audioLabels);
         filterLines.push(...concatResult.filterLines);
         outVideo = concatResult.outVideo;
         outAudio = concatResult.outAudio;
       }
-    } else if (trackResults['0'].videoLabels.length === 1 && trackResults['0'].audioLabels.length === 1) {
-      outVideo = trackResults['0'].videoLabels[0];
-      outAudio = trackResults['0'].audioLabels[0];
+    } else if (track0Result.videoLabels.length === 1 && track0Result.audioLabels.length === 1) {
+      outVideo = track0Result.videoLabels[0];
+      outAudio = track0Result.audioLabels[0];
     }
 
-    // Process overlay tracks (1, 2, 3)
+    // Composite the main track over a black background plate. This is what
+    // actually makes track 0's opacity visible: the final output codec has
+    // no alpha channel, so a semi-transparent main track needs something
+    // opaque underneath it to blend against (mirrors the black-cleared
+    // canvas used by the live preview).
+    if (outVideo) {
+      const plateW = outputWidth || 1280;
+      const plateH = outputHeight || 720;
+      const plateDuration = totalDuration || 1;
+      filterLines.push(
+        `color=c=black:s=${plateW}x${plateH}:d=${plateDuration}:r=${fps || 30}[bgplate]`
+      );
+      filterLines.push(`[bgplate]${outVideo}overlay=x=0:y=0[track0comp]`);
+      outVideo = '[track0comp]';
+    }
+
+    // Process overlay tracks (1, 2, 3). Each clip is trimmed and time-shifted
+    // to its own timelineStart, then overlaid individually onto the running
+    // composite — this keeps clips positioned/timed correctly even when a
+    // track has multiple, possibly non-contiguous, clips.
     for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
       const clips = tracks[String(trackIdx)];
       if (!clips || clips.length === 0) continue;
 
-      // Concatenate clips in this overlay track
-      let trackOutVideo = null;
-      if (clips.length > 1) {
-        const videoLabels = trackResults[String(trackIdx)].videoLabels.filter(l => l);
-        const audioLabels = trackResults[String(trackIdx)].audioLabels.filter(l => l);
-        if (videoLabels.length > 0 && audioLabels.length > 0) {
-          const concatResult = buildConcatFilter(videoLabels, audioLabels);
-          filterLines.push(...concatResult.filterLines);
-          trackOutVideo = concatResult.outVideo;
-        }
-      } else if (trackResults[String(trackIdx)].videoLabels.length === 1) {
-        trackOutVideo = trackResults[String(trackIdx)].videoLabels[0];
-      }
-
-      if (!trackOutVideo) continue;
-
-      // Apply overlay for each clip in this track
       for (let clipIdx = 0; clipIdx < clips.length; clipIdx++) {
         const clip = clips[clipIdx];
-        const duration = clip.sourceOut - (clip.sourceIn || 0);
+        const media = MEDIA_STORE.get(clip.sourceId);
+        if (!media || !media.hasVideo || clip.type === 'audio') continue; // overlay tracks: video only
+
+        const inputIndex = inputIndexMap.get(clip.sourceId);
+        const sourceIn = clip.sourceIn || 0;
+        const sourceOut = clip.sourceOut;
+        const duration = sourceOut - sourceIn;
         const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
         const x = clip.x || 0;
         const y = clip.y || 0;
         const timelineStart = clip.timelineStart || 0;
         const end = timelineStart + duration;
+        // Mirror the live preview: an overlay clip is drawn scaled to its
+        // clip.width/clip.height box (falling back to the source media's
+        // own size), not at its native resolution. Without this, a source
+        // video larger than the requested box overflows off the edge of
+        // the frame and only whatever corner still overlaps the canvas
+        // ends up visible in the export.
+        const overlayWidth = clip.width || media.width || outputWidth;
+        const overlayHeight = clip.height || media.height || outputHeight;
 
-        const ovLabel = `ov${trackIdx}_${clipIdx}`;
-        const ovFmtLabel = `ov${trackIdx}_${clipIdx}_fmt`;
+        const trimLabel = `ov${trackIdx}_${clipIdx}_trim`;
+        const fmtLabel = `ov${trackIdx}_${clipIdx}_fmt`;
+        const outLabel = `ov${trackIdx}_${clipIdx}_out`;
 
         filterLines.push(
-          `[${trackOutVideo}]format=rgba,colorchannelmixer=aa=${opacity}[${ovFmtLabel}]`
+          `[${inputIndex}:v]trim=start=${sourceIn}:end=${sourceOut},setpts=PTS-STARTPTS+${timelineStart}/TB,scale=${overlayWidth}:${overlayHeight}[${trimLabel}]`
         );
-
-        let overlayInput = `[${ovFmtLabel}]`;
-        if (clipIdx === 0) {
-          overlayInput = `[${outVideo}][${ovFmtLabel}]`;
-        }
-
-        const outLabel = clipIdx < clips.length - 1 ? `[ov${trackIdx}_${clipIdx}]` : `[ov${trackIdx}]`;
         filterLines.push(
-          `[${overlayInput}]overlay=enable='between(t,${timelineStart},${end})':x=${x}:y=${y}${outLabel}`
+          `[${trimLabel}]format=rgba,colorchannelmixer=aa=${opacity}[${fmtLabel}]`
         );
+        filterLines.push(
+          `${outVideo}[${fmtLabel}]overlay=enable='between(t,${timelineStart},${end})':x=${x}:y=${y}[${outLabel}]`
+        );
+        outVideo = `[${outLabel}]`;
       }
-
-      const lastOvLabel = clips.length === 1 ? `[ov${trackIdx}_0]` : `[ov${trackIdx}]`;
-      outVideo = lastOvLabel;
     }
 
     // Handle audio-only case
@@ -954,7 +967,14 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const filePath = path.join(__dirname, job.outputPath);
+      // job.outputPath is already an absolute path (it was built with
+      // path.join(OUTPUT_DIR, ...) when the job finished). Re-joining it
+      // with __dirname here doesn't make it absolute — path.join treats
+      // every argument as a relative segment, so this produced a bogus
+      // doubled-up path (e.g. ".../Minicut-main/home/claude/Minicut-main/...")
+      // that never existed on disk, and every download 404'd even though
+      // the export itself succeeded.
+      const filePath = job.outputPath;
       if (!fs.existsSync(filePath)) {
         sendJson(res, 404, { error: 'not_found', message: 'Export file not found on disk' });
         return;

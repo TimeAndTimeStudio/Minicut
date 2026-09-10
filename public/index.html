@@ -4,15 +4,31 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Minicut — Web Video Editor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <div id="app">
     <header>
-      <h1>Minicut</h1>
-      <div style="display:flex;gap:8px;">
-        <button id="split-btn" disabled>Split</button>
-        <button id="export-btn" disabled>Export</button>
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M4 6h11l4 4v8H4z"/>
+            <path d="M15 6v4h4"/>
+          </svg>
+        </span>
+        <h1>Minicut</h1>
+      </div>
+      <div class="header-actions">
+        <button id="split-btn" class="btn btn-ghost" disabled title="Split clip at playhead (S)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M6 3v6M18 3v6M6 21v-6M18 21v-6M4 12h16"/>
+          </svg>
+          Split
+        </button>
+        <button id="export-btn" class="btn btn-primary" disabled>Export</button>
       </div>
     </header>
 
@@ -20,13 +36,32 @@
       <canvas id="preview-canvas" width="1280" height="720"></canvas>
     </div>
 
+    <div id="transport-bar">
+      <button id="play-btn" class="btn-icon" title="Play / Pause (Space)">
+        <svg id="play-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M8 5v14l11-7z"/>
+        </svg>
+        <svg id="pause-icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="display:none">
+          <path d="M6 5h4v14H6zM14 5h4v14h-4z"/>
+        </svg>
+      </button>
+      <span id="timecode"><span id="timecode-current">00:00.0</span><span class="timecode-sep">/</span><span id="timecode-total">00:00.0</span></span>
+    </div>
+
     <div id="upload-panel">
-      <input type="file" id="file-input" multiple accept="video/*,audio/*">
+      <div class="panel-heading">Media</div>
+      <label id="upload-drop" for="file-input">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 3v12M7 8l5-5 5 5M5 21h14"/>
+        </svg>
+        Add media
+      </label>
+      <input type="file" id="file-input" multiple accept="video/*,audio/*" hidden>
       <div id="media-library"></div>
     </div>
 
     <div id="timeline-panel">
-      <div id="main-track" class="track" data-track-index="0"></div>
+      <div id="main-track" class="track track-main" data-track-index="0"></div>
       <div id="overlay-track-1" class="track overlay-track" data-track-index="1"></div>
       <div id="overlay-track-2" class="track overlay-track" data-track-index="2"></div>
       <div id="overlay-track-3" class="track overlay-track" data-track-index="3"></div>

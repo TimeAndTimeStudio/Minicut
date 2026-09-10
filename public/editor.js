@@ -35,6 +35,41 @@
   const exportBtn = $('#export-btn');
   const splitBtn = $('#split-btn');
   const exportStatus = $('#export-status');
+  const playBtn = $('#play-btn');
+  const playIcon = $('#play-icon');
+  const pauseIcon = $('#pause-icon');
+  const timecodeCurrent = $('#timecode-current');
+  const timecodeTotal = $('#timecode-total');
+
+  const TRACK_TAGS = { 0: 'MAIN', 1: 'OVERLAY 1', 2: 'OVERLAY 2', 3: 'OVERLAY 3' };
+
+  function formatTimecode(seconds) {
+    const s = Math.max(0, seconds || 0);
+    const m = Math.floor(s / 60);
+    const rem = (s % 60).toFixed(1).padStart(4, '0');
+    return `${String(m).padStart(2, '0')}:${rem}`;
+  }
+
+  function updateTimecode() {
+    if (timecodeCurrent) timecodeCurrent.textContent = formatTimecode(state.playhead);
+    if (timecodeTotal) timecodeTotal.textContent = formatTimecode(state.totalDuration);
+  }
+
+  if (playBtn) {
+    playBtn.addEventListener('click', () => {
+      if (state.isPlaying) {
+        stopPlayback();
+      } else {
+        startPlayback();
+      }
+    });
+  }
+
+  function setPlayButtonState(isPlaying) {
+    if (!playIcon || !pauseIcon) return;
+    playIcon.style.display = isPlaying ? 'none' : '';
+    pauseIcon.style.display = isPlaying ? '' : 'none';
+  }
 
   // ======================== MEDIA LIBRARY ========================
   async function loadMediaLibrary() {
@@ -213,15 +248,28 @@
   }
 
   // ======================== TOTAL DURATION ========================
+  // Total timeline length must cover every track, not just the main track (0).
+  // Overlay clips (tracks 1-3) can be dragged/placed further out on the
+  // timeline than the last main-track clip, and playback should run to
+  // whichever point is furthest — otherwise it stops as soon as the main
+  // track ends even though an overlay is still visible past that point.
   function recalcTotalDuration() {
-    state.totalDuration = state.timeline.tracks['0'].reduce((sum, clip) => {
-      return sum + ((clip.sourceOut || 0) - (clip.sourceIn || 0));
-    }, 0);
+    let maxEnd = 0;
+    for (let trackIndex = 0; trackIndex <= 3; trackIndex++) {
+      const clips = state.timeline.tracks[String(trackIndex)] || [];
+      for (const clip of clips) {
+        const clipStart = clip.timelineStart || 0;
+        const clipEnd = clipStart + ((clip.sourceOut || 0) - (clip.sourceIn || 0));
+        if (clipEnd > maxEnd) maxEnd = clipEnd;
+      }
+    }
+    state.totalDuration = maxEnd;
   }
 
   // ======================== TIMELINE RENDERING ========================
   function renderTimeline() {
     updatePixelPerSecond();
+    updateTimecode();
     exportBtn.disabled = state.timeline.tracks['0'].length === 0;
 
     // Enable split button if playhead is within any clip
@@ -257,6 +305,12 @@
       if (!trackEl) continue;
 
       trackEl.innerHTML = '';
+
+      const tag = document.createElement('span');
+      tag.className = 'track-tag';
+      tag.textContent = TRACK_TAGS[trackIndex] || '';
+      trackEl.appendChild(tag);
+
       const clips = state.timeline.tracks[String(trackIndex)];
 
       clips.forEach((clip) => {
@@ -303,7 +357,7 @@
           if (e.target.classList.contains('clip-handle')) return;
           e.stopPropagation();
           if (justDragged) return;
-          selectClip(clip, e.ctrlKey || e.metaKey);
+          selectClip(clip);
         });
 
         trackEl.appendChild(el);
@@ -346,7 +400,7 @@
 
 
   // ======================== CLIP SELECTION ========================
-  function selectClip(clip, showPanel = false) {
+  function selectClip(clip, showPanel = true) {
     state.selectedClip = clip;
 
     // Remove old selection visuals
@@ -356,7 +410,9 @@
     const clipEl = document.querySelector(`.clip[data-clip-id="${clip.id}"]`);
     if (clipEl) clipEl.classList.add('selected');
 
-    // Show properties panel
+    // Always refresh the properties panel to the newly selected clip so it
+    // never shows stale values (or none at all) from a previously selected
+    // clip — it must reflect this clip's real opacity/x/y/width/height.
     if (showPanel) {
       renderPropertiesPanel(clip);
     }
@@ -382,8 +438,8 @@
 
     let html = `<h3>Clip Properties</h3>
       <div class="prop-row">
-        <label>Opacity: <span id="opacity-value">${(clip.opacity || 1.0).toFixed(2)}</span></label>
-        <input type="range" id="opacity-slider" min="0" max="100" value="${(clip.opacity || 1.0) * 100}" step="1">
+        <label>Opacity: <span id="opacity-value">${(clip.opacity !== undefined ? clip.opacity : 1.0).toFixed(2)}</span></label>
+        <input type="range" id="opacity-slider" min="0" max="100" value="${(clip.opacity !== undefined ? clip.opacity : 1.0) * 100}" step="1">
       </div>`;
 
     if (isVideoOrImage) {
@@ -405,11 +461,10 @@
     }
 
     html += `<div class="prop-row">
-      <button id="delete-clip-btn" style="background:#e94560;color:#fff;border:none;padding:4px 12px;border-radius:3px;cursor:pointer;" onclick="window._handleDeleteClip()">Delete Clip</button>
+      <button id="delete-clip-btn" class="btn" style="background:var(--danger);color:#fff;" onclick="window._handleDeleteClip()">Delete Clip</button>
     </div>`;
 
     panel.innerHTML = html;
-    panel.style.cssText = 'position:fixed;right:10px;top:100px;background:#16213e;border:1px solid #0f3460;padding:12px;border-radius:6px;z-index:100;min-width:220px;';
 
     document.body.appendChild(panel);
 
@@ -518,6 +573,15 @@
       document.removeEventListener('mouseup', onClipDragEnd);
       shadow.remove();
 
+      // A plain click (mousedown+mouseup with no movement in between) never
+      // ran onClipDrag, so the clip was never spliced out of its track array.
+      // Skip the reposition/rebuild entirely in that case — otherwise we'd
+      // push a duplicate of the clip into the track, and rebuilding the
+      // timeline DOM here would replace the clip element out from under the
+      // browser's pending 'click' event, so a plain click could never
+      // select the clip or open the properties panel.
+      if (!justDragged) return;
+
       const target = document.elementFromPoint(e.clientX, e.clientY);
       const targetTrack = target?.closest?.('.track');
       let targetTrackIndex = sourceTrackIndex;
@@ -561,6 +625,7 @@
         }
       }
 
+      recalcTotalDuration();
       renderTimeline();
       renderCanvas();
     }
@@ -595,7 +660,9 @@
     function onClipResizeEnd() {
       document.removeEventListener('mousemove', onClipResize);
       document.removeEventListener('mouseup', onClipResizeEnd);
-      if (trackIndex === 0) recalcTotalDuration();
+      recalcTotalDuration();
+      renderTimeline();
+      renderCanvas();
     }
   }
 
@@ -633,7 +700,7 @@
           clip.sourceOut = splitSourceTime;
           clips.splice(i + 1, 0, newClip);
 
-          if (trackIndex === 0) recalcTotalDuration();
+          recalcTotalDuration();
           renderTimeline();
           renderCanvas();
           return;
@@ -649,7 +716,7 @@
       const idx = clips.indexOf(clip);
       if (idx !== -1) {
         clips.splice(idx, 1);
-        if (trackIndex === 0) recalcTotalDuration();
+        recalcTotalDuration();
         renderTimeline();
         renderCanvas();
         clearSelection();
@@ -675,6 +742,16 @@
 
   function doRenderCanvas(playheadTime) {
     let anyClipReady = false;
+
+    // Clear the offscreen canvas to black before drawing this frame's clips.
+    // Without this, pixels from the previous frame (or from a lower-opacity
+    // clip on track 1) stay on the canvas and blend with whatever is drawn
+    // next, so a clip's opacity slider looks like it has no effect — you're
+    // seeing new (partially transparent) pixels composited on top of old,
+    // fully-opaque ones instead of on top of a clean background.
+    offCtx.globalAlpha = 1.0;
+    offCtx.fillStyle = '#000000';
+    offCtx.fillRect(0, 0, offscreen.width, offscreen.height);
 
     // Draw all tracks in order (0 -> 1 -> 2 -> 3)
     for (let trackIndex = 0; trackIndex <= 3; trackIndex++) {
@@ -721,6 +798,22 @@
             } else {
               // Video clip
               const videoEl = getVideoElement(clip.sourceId);
+
+              let w, h, x, y;
+              if (trackIndex === 0) {
+                w = offscreen.width;
+                h = offscreen.height;
+                x = 0;
+                y = 0;
+              } else {
+                w = clip.width || media.width || offscreen.width;
+                h = clip.height || media.height || offscreen.height;
+                x = clip.x !== undefined ? clip.x : (offscreen.width - w) / 2;
+                y = clip.y !== undefined ? clip.y : (offscreen.height - h) / 2;
+              }
+
+              const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
+
               if (videoEl && videoEl.readyState >= 2) {
                 const clipLocalTime = playheadTime - clipStart;
                 const sourceTime = clip.sourceIn + clipLocalTime;
@@ -728,24 +821,16 @@
                 if (Math.abs(videoEl.currentTime - sourceTime) > 0.1) {
                   videoEl.currentTime = sourceTime;
                 }
+              }
 
-                let w, h, x, y;
-                if (trackIndex === 0) {
-                  w = offscreen.width;
-                  h = offscreen.height;
-                  x = 0;
-                  y = 0;
-                } else {
-                  w = clip.width || media.width || offscreen.width;
-                  h = clip.height || media.height || offscreen.height;
-                  x = clip.x !== undefined ? clip.x : (offscreen.width - w) / 2;
-                  y = clip.y !== undefined ? clip.y : (offscreen.height - h) / 2;
-                }
-
-                const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
-                offCtx.globalAlpha = opacity;
-                offCtx.drawImage(videoEl, x, y, w, h);
-                offCtx.globalAlpha = 1.0;
+              // Draw the live video frame when ready; otherwise fall back to
+              // the last good frame so a momentary seek/buffer stall (very
+              // common right after setting currentTime every render tick)
+              // doesn't make the clip vanish for a frame. Without this,
+              // an overlay flickers on and off whenever it sits on top of
+              // the main track, because the main track is redrawn full-canvas
+              // first and briefly shows through where the overlay should be.
+              if (drawVideoFrame(clip.sourceId, videoEl, x, y, w, h, opacity)) {
                 anyClipReady = true;
               }
             }
@@ -760,6 +845,41 @@
 
   // Hidden video elements pool
   const videoPool = new Map();
+
+  // Last-good-frame cache, keyed by mediaId. Holds a small canvas with the
+  // most recent successfully-decoded frame for each video so playback can
+  // keep drawing something during the brief 'not ready' window that follows
+  // every currentTime seek, instead of skipping the draw for that frame.
+  const frameCache = new Map();
+
+  function drawVideoFrame(mediaId, videoEl, x, y, w, h, opacity) {
+    let source = null;
+
+    if (videoEl && videoEl.readyState >= 2 && videoEl.videoWidth > 0) {
+      let cache = frameCache.get(mediaId);
+      if (!cache) {
+        cache = { canvas: document.createElement('canvas'), ctx: null };
+        cache.ctx = cache.canvas.getContext('2d');
+        frameCache.set(mediaId, cache);
+      }
+      if (cache.canvas.width !== videoEl.videoWidth || cache.canvas.height !== videoEl.videoHeight) {
+        cache.canvas.width = videoEl.videoWidth;
+        cache.canvas.height = videoEl.videoHeight;
+      }
+      cache.ctx.drawImage(videoEl, 0, 0, cache.canvas.width, cache.canvas.height);
+      source = videoEl;
+    } else {
+      const cache = frameCache.get(mediaId);
+      if (cache) source = cache.canvas;
+    }
+
+    if (!source) return false;
+
+    offCtx.globalAlpha = opacity;
+    offCtx.drawImage(source, x, y, w, h);
+    offCtx.globalAlpha = 1.0;
+    return true;
+  }
 
   function getVideoElement(mediaId) {
     if (videoPool.has(mediaId)) {
@@ -806,13 +926,17 @@
 
   function startPlayback() {
     if (state.isPlaying) return;
+    if (state.totalDuration <= 0) return;
+    if (state.playhead >= state.totalDuration) state.playhead = 0;
     state.isPlaying = true;
+    setPlayButtonState(true);
     lastFrameTime = performance.now();
     playLoop();
   }
 
   function stopPlayback() {
     state.isPlaying = false;
+    setPlayButtonState(false);
     if (state.animFrameId) {
       cancelAnimationFrame(state.animFrameId);
       state.animFrameId = null;
@@ -878,6 +1002,7 @@
 
       if (resp.status === 429) {
         exportStatus.textContent = 'Export busy, please wait...';
+        exportBtn.disabled = false;
         return;
       }
 
@@ -900,7 +1025,7 @@
           exportStatus.textContent = `Exporting... ${Math.round(data.progress * 100)}%`;
           setTimeout(poll, 500);
         } else if (data.status === 'done') {
-          exportStatus.textContent = `Export complete! [${data.outputPath}]`;
+          exportStatus.textContent = 'Export complete!';
           exportBtn.disabled = false;
 
           // Add download link
@@ -948,6 +1073,7 @@
     }
   });
 
+
   // ======================== INIT ========================
   function init() {
     loadMediaLibrary();
@@ -970,3 +1096,4 @@
     init();
   }
 })();
+
