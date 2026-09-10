@@ -10,7 +10,10 @@
   <div id="app">
     <header>
       <h1>Minicut</h1>
-      <button id="export-btn" disabled>Export</button>
+      <div style="display:flex;gap:8px;">
+        <button id="split-btn" disabled>Split</button>
+        <button id="export-btn" disabled>Export</button>
+      </div>
     </header>
 
     <div id="preview-panel">
@@ -18,12 +21,12 @@
     </div>
 
     <div id="upload-panel">
-      <input type="file" id="file-input" multiple accept="video/*">
+      <input type="file" id="file-input" multiple accept="video/*,audio/*">
       <div id="media-library"></div>
     </div>
 
     <div id="timeline-panel">
-      <div id="main-track" class="track"></div>
+      <div id="main-track" class="track" data-track-index="0"></div>
       <div id="overlay-track-1" class="track overlay-track" data-track-index="1"></div>
       <div id="overlay-track-2" class="track overlay-track" data-track-index="2"></div>
       <div id="overlay-track-3" class="track overlay-track" data-track-index="3"></div>

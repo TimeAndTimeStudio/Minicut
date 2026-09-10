@@ -18,6 +18,7 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  overflow: hidden;
 }
 
 header {
@@ -56,6 +57,8 @@ header h1 {
   justify-content: center;
   background: #0f0f1a;
   padding: 10px;
+  min-height: 0;
+  overflow: hidden;
 }
 
 #preview-canvas {
@@ -84,17 +87,23 @@ header h1 {
   background: #1a1a2e;
   border-top: 1px solid #0f3460;
   padding: 8px 16px;
-  min-height: 200px;
+  min-height: 160px;
+  max-height: 35vh;
   overflow-x: auto;
+  overflow-y: auto;
   position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-shrink: 0;
 }
 
 .track {
-  min-height: 40px;
+  min-height: 36px;
+  max-height: 60px;
   background: #16213e;
   border: 1px dashed #0f3460;
   border-radius: 4px;
-  margin-bottom: 4px;
   padding: 4px 8px;
   font-size: 12px;
   color: #888;
@@ -122,6 +131,7 @@ header h1 {
   cursor: grab;
   font-size: 11px;
   max-width: 120px;
+  position: relative;
 }
 
 .media-item:hover {
@@ -136,6 +146,18 @@ header h1 {
   margin-bottom: 4px;
 }
 
+.media-item .audio-icon {
+  width: 100px;
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  margin-bottom: 4px;
+  background: #1a1a2e;
+  border-radius: 2px;
+}
+
 .media-name {
   color: #ccc;
   white-space: nowrap;
@@ -147,6 +169,29 @@ header h1 {
 .media-dur {
   color: #888;
   font-size: 10px;
+}
+
+.delete-media-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  background: rgba(233, 69, 96, 0.8);
+  color: white;
+  border: none;
+  border-radius: 3px;
+  padding: 2px 5px;
+  font-size: 12px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+
+.media-item:hover .delete-media-btn {
+  opacity: 1;
+}
+
+.delete-media-btn:hover {
+  background: rgba(233, 69, 96, 1);
 }
 
 /* Clips */
@@ -187,6 +232,12 @@ header h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   pointer-events: none;
+  line-height: 1.4;
+}
+
+.clip.drag-shadow {
+  opacity: 0.5;
+  pointer-events: none;
 }
 
 .clip-handle {
@@ -219,10 +270,21 @@ header h1 {
   position: absolute;
   top: 0;
   bottom: 0;
+  width: 12px;
+  margin-left: -6px;
+  background: transparent;
+  z-index: 50;
+  pointer-events: auto;
+  cursor: col-resize;
+}
+.playhead::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 6px;
   width: 2px;
   background: #e94560;
-  z-index: 50;
-  pointer-events: none;
 }
 
 /* Properties panel */

@@ -9,8 +9,7 @@
       outputWidth: 1280,
       outputHeight: 720,
       fps: 30,
-      mainTrack: [],
-      overlayTracks: { '1': [], '2': [], '3': [] },
+      tracks: { '0': [], '1': [], '2': [], '3': [] },
     },
     playhead: 0,
     selectedClip: null,
@@ -24,13 +23,43 @@
   const $ = (sel) => document.querySelector(sel);
   const canvas = $('#preview-canvas');
   const ctx = canvas.getContext('2d');
+
+  // Offscreen canvas for double buffering
+  const offscreen = document.createElement('canvas');
+  offscreen.width = canvas.width;
+  offscreen.height = canvas.height;
+  const offCtx = offscreen.getContext('2d');
   const fileInput = $('#file-input');
   const mediaLibrary = $('#media-library');
   const mainTrackEl = $('#main-track');
   const exportBtn = $('#export-btn');
+  const splitBtn = $('#split-btn');
   const exportStatus = $('#export-status');
 
   // ======================== MEDIA LIBRARY ========================
+  async function loadMediaLibrary() {
+    try {
+      const resp = await fetch('/api/media');
+      const mediaList = await resp.json();
+      state.mediaLibrary = mediaList;
+      renderMediaLibrary();
+    } catch (err) {
+      console.error('Failed to load media:', err);
+    }
+  }
+
+  async function deleteMedia(mediaId) {
+    try {
+      const resp = await fetch(`/api/media/${mediaId}`, { method: 'DELETE' });
+      if (resp.ok) {
+        state.mediaLibrary = state.mediaLibrary.filter(m => m.id !== mediaId);
+        renderMediaLibrary();
+      }
+    } catch (err) {
+      console.error('Failed to delete media:', err);
+    }
+  }
+
   fileInput.addEventListener('change', async (e) => {
     const files = e.target.files;
     if (!files.length) return;
@@ -63,14 +92,47 @@
       thumb.className = 'media-item';
       thumb.draggable = true;
       thumb.dataset.mediaId = media.id;
-      thumb.innerHTML = `<video src="/api/media/${media.id}/stream" muted preload="metadata"></video>
-        <span class="media-name">${media.filename.split('/').pop().slice(0, 20)}</span>
-        <span class="media-dur">${media.duration.toFixed(1)}s</span>`;
+
+      if (media.hasVideo) {
+        thumb.innerHTML = `<video src="/api/media/${media.id}/stream" muted preload="metadata"></video>
+          <span class="media-name">${media.filename.split('/').pop().slice(0, 20)}</span>
+          <span class="media-dur">${media.duration.toFixed(1)}s</span>
+          <button class="delete-media-btn" data-media-id="${media.id}">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+              <path d="M10 11v6M14 11v6"/>
+            </svg>
+          </button>`;
+      } else {
+        thumb.innerHTML = `<div class="audio-icon">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M9 18V5l12-2v13"/>
+              <circle cx="6" cy="18" r="3"/>
+              <circle cx="18" cy="16" r="3"/>
+            </svg>
+          </div>
+          <span class="media-name">${media.filename.split('/').pop().slice(0, 20)}</span>
+          <span class="media-dur">${media.duration.toFixed(1)}s</span>
+          <button class="delete-media-btn" data-media-id="${media.id}">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+              <path d="M10 11v6M14 11v6"/>
+            </svg>
+          </button>`;
+      }
 
       thumb.addEventListener('dragstart', (e) => {
         e.dataTransfer.setData('mediaId', media.id);
         e.dataTransfer.setData('type', 'new-clip');
       });
+
+      const deleteBtn = thumb.querySelector('.delete-media-btn');
+      if (deleteBtn) {
+        deleteBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          deleteMedia(media.id);
+        });
+      }
 
       mediaLibrary.appendChild(thumb);
     }
@@ -79,13 +141,13 @@
   // ======================== TRACK SETUP ========================
   function setupTracks() {
     const tracks = [
-      { el: mainTrackEl, trackIndex: 0, isMain: true },
-      { el: $('#overlay-track-1'), trackIndex: 1, isMain: false },
-      { el: $('#overlay-track-2'), trackIndex: 2, isMain: false },
-      { el: $('#overlay-track-3'), trackIndex: 3, isMain: false },
+      { el: mainTrackEl, trackIndex: 0 },
+      { el: $('#overlay-track-1'), trackIndex: 1 },
+      { el: $('#overlay-track-2'), trackIndex: 2 },
+      { el: $('#overlay-track-3'), trackIndex: 3 },
     ];
 
-    for (const { el, trackIndex, isMain } of tracks) {
+    for (const { el, trackIndex } of tracks) {
       if (!el) continue;
 
       // Drop zone for new clips from media library
@@ -111,34 +173,36 @@
 
           const rect = el.getBoundingClientRect();
           const x = e.clientX - rect.left + el.scrollLeft;
-          const timelineStart = Math.max(0, x / state.pixelPerSecond);
+          const timelineStart = trackIndex === 0 ? 0 : Math.max(0, x / state.pixelPerSecond);
 
-          if (isMain) {
-            const clip = {
-              id: 'clip_' + crypto.randomUUID().replace(/-/g, ''),
-              sourceId: mediaId,
-              type: 'video',
-              sourceIn: 0,
-              sourceOut: media.duration,
-              trackIndex: 0,
-            };
-            state.timeline.mainTrack.push(clip);
-          } else {
-            const clip = {
-              id: 'clip_' + crypto.randomUUID().replace(/-/g, ''),
-              sourceId: mediaId,
-              sourceIn: 0,
-              sourceOut: media.duration,
-              trackIndex,
-              timelineStart,
-              x: 20,
-              y: 20,
-              width: 320,
-              height: 180,
-              opacity: 1.0,
-            };
-            state.timeline.overlayTracks[String(trackIndex)].push(clip);
+          const isVideoOrImage = media.hasVideo || (media.contentType && media.contentType.startsWith('image/'));
+
+          const clip = {
+            id: 'clip_' + crypto.randomUUID().replace(/-/g, ''),
+            sourceId: mediaId,
+            type: isVideoOrImage ? (media.contentType && media.contentType.startsWith('image/') ? 'image' : 'video') : 'audio',
+            sourceIn: 0,
+            sourceOut: media.duration,
+            trackIndex: trackIndex,
+            timelineStart: timelineStart,
+            opacity: 1.0,
+          };
+
+          if (isVideoOrImage) {
+            if (trackIndex === 0) {
+              clip.x = undefined;
+              clip.y = undefined;
+              clip.width = media.width || 1280;
+              clip.height = media.height || 720;
+            } else {
+              clip.x = 20;
+              clip.y = 20;
+              clip.width = 320;
+              clip.height = 180;
+            }
           }
+
+          state.timeline.tracks[String(trackIndex)].push(clip);
 
           recalcTotalDuration();
           renderTimeline();
@@ -150,17 +214,31 @@
 
   // ======================== TOTAL DURATION ========================
   function recalcTotalDuration() {
-    state.totalDuration = state.timeline.mainTrack.reduce((sum, clip) => {
+    state.totalDuration = state.timeline.tracks['0'].reduce((sum, clip) => {
       return sum + ((clip.sourceOut || 0) - (clip.sourceIn || 0));
     }, 0);
   }
 
   // ======================== TIMELINE RENDERING ========================
   function renderTimeline() {
-    renderMainTrack();
-    renderOverlayTracks();
     updatePixelPerSecond();
-    exportBtn.disabled = state.timeline.mainTrack.length === 0;
+    exportBtn.disabled = state.timeline.tracks['0'].length === 0;
+
+    // Enable split button if playhead is within any clip
+    let playheadInClip = false;
+    for (let trackIndex = 0; trackIndex <= 3; trackIndex++) {
+      const clips = state.timeline.tracks[String(trackIndex)];
+      for (const clip of clips) {
+        const clipStart = clip.timelineStart || 0;
+        const clipEnd = clipStart + (clip.sourceOut - clip.sourceIn);
+        if (state.playhead >= clipStart && state.playhead <= clipEnd) {
+          playheadInClip = true;
+          break;
+        }
+      }
+      if (playheadInClip) break;
+    }
+    splitBtn.disabled = !playheadInClip;
   }
 
   function updatePixelPerSecond() {
@@ -168,132 +246,107 @@
     if (state.totalDuration > 0) {
       state.pixelPerSecond = Math.max(10, Math.min(200, panelWidth / state.totalDuration));
     }
-    renderMainTrack();
-    renderOverlayTracks();
+    renderTracks();
   }
 
-  function renderMainTrack() {
-    mainTrackEl.innerHTML = '';
-    const clips = state.timeline.mainTrack;
-    const trackIndex = 0;
-
-    clips.forEach((clip, index) => {
-      const duration = clip.sourceOut - clip.sourceIn;
-      const width = duration * state.pixelPerSecond;
-
-      const el = document.createElement('div');
-      el.className = 'clip clip-main';
-      el.dataset.clipId = clip.id;
-      el.dataset.trackIndex = trackIndex;
-      el.dataset.index = index;
-      el.style.width = width + 'px';
-      el.style.left = (index === 0 ? 0 : getCumulativeLeft(clips, index)) + 'px';
-      el.title = `Clip: ${clip.sourceId} | ${duration.toFixed(2)}s`;
-
-      el.innerHTML = `<span class="clip-label">${clip.sourceId.slice(-8)}</span>
-        <div class="clip-handle clip-handle-left"></div>
-        <div class="clip-handle clip-handle-right"></div>`;
-
-      // Drag reorder
-      el.addEventListener('mousedown', (e) => {
-        if (e.target.classList.contains('clip-handle')) return;
-        startMainDrag(e, clip, index);
-      });
-
-      // Resize (trim)
-      el.querySelector('.clip-handle-left').addEventListener('mousedown', (e) => {
-        e.stopPropagation();
-        startMainResize(e, clip, index, 'left');
-      });
-      el.querySelector('.clip-handle-right').addEventListener('mousedown', (e) => {
-        e.stopPropagation();
-        startMainResize(e, clip, index, 'right');
-      });
-
-      // Selection
-      el.addEventListener('click', (e) => {
-        e.stopPropagation();
-        selectClip(clip);
-      });
-
-      mainTrackEl.appendChild(el);
-    });
-
-    // Playhead
-    const playhead = document.createElement('div');
-    playhead.className = 'playhead';
-    playhead.style.left = (state.playhead * state.pixelPerSecond) + 'px';
-    mainTrackEl.appendChild(playhead);
-  }
-
-  function getCumulativeLeft(clips, index) {
-    let left = 0;
-    for (let i = 0; i < index; i++) {
-      left += (clips[i].sourceOut - clips[i].sourceIn) * state.pixelPerSecond;
-    }
-    return left;
-  }
-
-  function renderOverlayTracks() {
-    for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
-      const trackEl = document.getElementById(`overlay-track-${trackIdx}`);
+  function renderTracks() {
+    for (let trackIndex = 0; trackIndex <= 3; trackIndex++) {
+      const trackEl = document.getElementById(
+        trackIndex === 0 ? 'main-track' : `overlay-track-${trackIndex}`
+      );
       if (!trackEl) continue;
-      trackEl.innerHTML = '';
 
-      const clips = state.timeline.overlayTracks[String(trackIdx)];
+      trackEl.innerHTML = '';
+      const clips = state.timeline.tracks[String(trackIndex)];
+
       clips.forEach((clip) => {
         const duration = clip.sourceOut - clip.sourceIn;
         const width = duration * state.pixelPerSecond;
         const left = (clip.timelineStart || 0) * state.pixelPerSecond;
 
         const el = document.createElement('div');
-        el.className = 'clip clip-overlay';
+        el.className = 'clip';
         el.dataset.clipId = clip.id;
-        el.dataset.trackIndex = trackIdx;
+        el.dataset.trackIndex = trackIndex;
         el.style.left = left + 'px';
         el.style.width = width + 'px';
         el.style.top = '4px';
-        el.title = `Overlay track ${trackIdx} | ${duration.toFixed(2)}s`;
 
-        el.innerHTML = `<span class="clip-label">OV${trackIdx}:${clip.sourceId.slice(-6)}</span>
+        const label = clip.type === 'audio'
+          ? `🎵 A${trackIndex}:${clip.sourceId.slice(-6)}`
+          : `${trackIndex === 0 ? 'M' : 'O' + trackIndex}:${clip.sourceId.slice(-6)}`;
+        el.innerHTML = `<span class="clip-label">${label}</span>
           <div class="clip-handle clip-handle-left"></div>
           <div class="clip-handle clip-handle-right"></div>`;
 
         // Drag to reposition
         el.addEventListener('mousedown', (e) => {
           if (e.target.classList.contains('clip-handle')) return;
-          startOverlayDrag(e, clip, trackIdx);
+          if (e.ctrlKey || e.metaKey) return;
+          startClipDrag(e, clip, trackIndex);
         });
 
-        // Resize
-        el.querySelector('.clip-handle-left').addEventListener('mousedown', (e) => {
-          e.stopPropagation();
-          startOverlayResize(e, clip, trackIdx, 'left');
-        });
-        el.querySelector('.clip-handle-right').addEventListener('mousedown', (e) => {
-          e.stopPropagation();
-          startOverlayResize(e, clip, trackIdx, 'right');
-        });
+        // Resize (เฉพาะ video clips)
+        if (clip.type === 'video') {
+          el.querySelector('.clip-handle-left').addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            startClipResize(e, clip, trackIndex, 'left');
+          });
+          el.querySelector('.clip-handle-right').addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            startClipResize(e, clip, trackIndex, 'right');
+          });
+        }
 
         // Selection
         el.addEventListener('click', (e) => {
+          if (e.target.classList.contains('clip-handle')) return;
           e.stopPropagation();
-          selectClip(clip);
+          if (justDragged) return;
+          selectClip(clip, e.ctrlKey || e.metaKey);
         });
 
         trackEl.appendChild(el);
       });
 
-      // Playhead for overlay tracks too
+      // Playhead
       const playhead = document.createElement('div');
       playhead.className = 'playhead';
       playhead.style.left = (state.playhead * state.pixelPerSecond) + 'px';
+      playhead.addEventListener('mousedown', (e) => {
+        e.stopPropagation();
+        startPlayheadDrag(e);
+      });
       trackEl.appendChild(playhead);
     }
   }
 
+  // ======================== PLAYHEAD DRAG (SCRUB) ========================
+  function startPlayheadDrag(e) {
+    const trackEl = mainTrackEl;
+
+    document.addEventListener('mousemove', onPlayheadDrag);
+    document.addEventListener('mouseup', onPlayheadDragEnd);
+
+    function onPlayheadDrag(e) {
+      const rect = trackEl.getBoundingClientRect();
+      const dx = e.clientX - rect.left;
+      const time = Math.max(0, dx / state.pixelPerSecond);
+      state.playhead = Math.min(time, state.totalDuration);
+      renderTimeline();
+      renderCanvas();
+    }
+
+    function onPlayheadDragEnd() {
+      document.removeEventListener('mousemove', onPlayheadDrag);
+      document.removeEventListener('mouseup', onPlayheadDragEnd);
+    }
+  }
+
+
+
   // ======================== CLIP SELECTION ========================
-  function selectClip(clip) {
+  function selectClip(clip, showPanel = false) {
     state.selectedClip = clip;
 
     // Remove old selection visuals
@@ -304,7 +357,9 @@
     if (clipEl) clipEl.classList.add('selected');
 
     // Show properties panel
-    renderPropertiesPanel(clip);
+    if (showPanel) {
+      renderPropertiesPanel(clip);
+    }
   }
 
   function clearSelection() {
@@ -322,7 +377,8 @@
     const panel = document.createElement('div');
     panel.id = 'properties-panel';
 
-    const isOverlay = clip.trackIndex >= 1 && clip.trackIndex <= 3;
+    const media = state.mediaLibrary.find((m) => m.id === clip.sourceId);
+    const isVideoOrImage = media && !media.contentType.startsWith('audio/');
 
     let html = `<h3>Clip Properties</h3>
       <div class="prop-row">
@@ -330,7 +386,7 @@
         <input type="range" id="opacity-slider" min="0" max="100" value="${(clip.opacity || 1.0) * 100}" step="1">
       </div>`;
 
-    if (isOverlay) {
+    if (isVideoOrImage) {
       const duration = clip.sourceOut - clip.sourceIn;
       html += `<div class="prop-row">
         <label>Timeline Start: ${clip.timelineStart.toFixed(2)}s</label>
@@ -339,17 +395,17 @@
         <label>Duration: ${duration.toFixed(2)}s</label>
       </div>
       <div class="prop-row">
-        <label>X: <input type="number" id="prop-x" value="${clip.x || 0}" min="0"></label>
-        <label>Y: <input type="number" id="prop-y" value="${clip.y || 0}" min="0"></label>
+        <label>X: <input type="number" id="prop-x" value="${clip.x !== undefined ? clip.x : ''}" min="0"></label>
+        <label>Y: <input type="number" id="prop-y" value="${clip.y !== undefined ? clip.y : ''}" min="0"></label>
       </div>
       <div class="prop-row">
-        <label>Width: <input type="number" id="prop-w" value="${clip.width || 320}" min="10"></label>
-        <label>Height: <input type="number" id="prop-h" value="${clip.height || 180}" min="10"></label>
+        <label>Width: <input type="number" id="prop-w" value="${clip.width || media?.width || 1280}" min="10"></label>
+        <label>Height: <input type="number" id="prop-h" value="${clip.height || media?.height || 720}" min="10"></label>
       </div>`;
     }
 
     html += `<div class="prop-row">
-      <button id="delete-clip-btn" style="background:#e94560;color:#fff;border:none;padding:4px 12px;border-radius:3px;cursor:pointer;">Delete Clip</button>
+      <button id="delete-clip-btn" style="background:#e94560;color:#fff;border:none;padding:4px 12px;border-radius:3px;cursor:pointer;" onclick="window._handleDeleteClip()">Delete Clip</button>
     </div>`;
 
     panel.innerHTML = html;
@@ -381,144 +437,145 @@
         });
       }
     });
-
-    // Delete button
-    const deleteBtn = $('#delete-clip-btn');
-    deleteBtn.addEventListener('click', () => {
-      deleteClip(clip);
-    });
   }
 
-  // ======================== MAIN TRACK DRAG (REORDER) ========================
-  function startMainDrag(e, clip, index) {
-    const trackEl = mainTrackEl;
-    const rect = trackEl.getBoundingClientRect();
+  // Global delete handler
+  window._handleDeleteClip = () => {
+    if (state.selectedClip) {
+      deleteClip(state.selectedClip);
+    }
+  };
+
+  // ======================== UNIFIED CLIP DRAG & RESIZE ========================
+  let justDragged = false;
+
+  function startClipDrag(e, clip, sourceTrackIndex) {
+    const trackEl = document.getElementById(
+      sourceTrackIndex === 0 ? 'main-track' : `overlay-track-${sourceTrackIndex}`
+    );
     const startX = e.clientX;
-    const originalIndex = index;
+    const startLeft = (clip.timelineStart || 0) * state.pixelPerSecond;
+    const originalStart = clip.timelineStart;
+    const duration = clip.sourceOut - clip.sourceIn;
+    justDragged = false;
 
-    document.addEventListener('mousemove', onMainDrag);
-    document.addEventListener('mouseup', onMainDragEnd);
+    // Create shadow element
+    const originalEl = document.querySelector(`.clip[data-clip-id="${clip.id}"]`);
+    const shadow = originalEl.cloneNode(true);
+    shadow.classList.add('drag-shadow');
+    shadow.style.opacity = '0.5';
+    trackEl.appendChild(shadow);
 
-    function onMainDrag(e) {
+    document.addEventListener('mousemove', onClipDrag);
+    document.addEventListener('mouseup', onClipDragEnd);
+
+    function onClipDrag(e) {
+      if (!justDragged) justDragged = true;
+
       const dx = e.clientX - startX;
-      const threshold = state.pixelPerSecond * 0.5;
+      let newLeft = Math.max(0, startLeft + dx);
+      let newStart = newLeft / state.pixelPerSecond;
 
-      if (Math.abs(dx) < threshold) return;
+      // Remove clip from original position temporarily
+      const clips = state.timeline.tracks[String(sourceTrackIndex)];
+      const idx = clips.indexOf(clip);
+      if (idx !== -1) clips.splice(idx, 1);
 
-      // Calculate new index based on drag direction
-      let newIndex = originalIndex + (dx > 0 ? 1 : -1);
-      newIndex = Math.max(0, Math.min(newIndex, state.timeline.mainTrack.length - 1));
+      const clipEnd = newStart + duration;
+      const SNAP_THRESHOLD = 0.1;
 
-      if (newIndex !== originalIndex) {
-        const clips = state.timeline.mainTrack;
-        const [moved] = clips.splice(originalIndex, 1);
-        clips.splice(newIndex, 0, moved);
-        renderTimeline();
+      // Snap to adjacent clips
+      for (const otherClip of clips) {
+        if (otherClip.id === clip.id) continue;
+        
+        const otherStart = otherClip.timelineStart || 0;
+        const otherEnd = otherStart + (otherClip.sourceOut - otherClip.sourceIn);
+        
+        // Snap to right edge of other clip
+        if (Math.abs(newStart - otherEnd) < SNAP_THRESHOLD) {
+          newStart = otherEnd;
+        }
+        // Snap to left edge of other clip
+        else if (Math.abs(clipEnd - otherStart) < SNAP_THRESHOLD) {
+          newStart = otherStart - duration;
+        }
       }
+
+      clip.timelineStart = newStart;
+      shadow.style.left = (newStart * state.pixelPerSecond) + 'px';
+
+      // Highlight drop target
+      document.querySelectorAll('.track').forEach(t => t.classList.remove('drag-over'));
+      const target = document.elementFromPoint(e.clientX, e.clientY);
+      const targetTrack = target?.closest?.('.track');
+      if (targetTrack) targetTrack.classList.add('drag-over');
+
+      renderCanvas();
     }
 
-    function onMainDragEnd() {
-      document.removeEventListener('mousemove', onMainDrag);
-      document.removeEventListener('mouseup', onMainDragEnd);
-    }
-  }
+    function onClipDragEnd(e) {
+      document.removeEventListener('mousemove', onClipDrag);
+      document.removeEventListener('mouseup', onClipDragEnd);
+      shadow.remove();
 
-  // ======================== MAIN TRACK RESIZE (TRIM) ========================
-  function startMainResize(e, clip, index, side) {
-    const trackEl = mainTrackEl;
-    const trackRect = trackEl.getBoundingClientRect();
-    const startX = e.clientX;
-    const originalSourceIn = clip.sourceIn;
-    const originalSourceOut = clip.sourceOut;
-    const media = state.mediaLibrary.find((m) => m.id === clip.sourceId);
+      const target = document.elementFromPoint(e.clientX, e.clientY);
+      const targetTrack = target?.closest?.('.track');
+      let targetTrackIndex = sourceTrackIndex;
 
-    document.addEventListener('mousemove', onMainResize);
-    document.addEventListener('mouseup', onMainResizeEnd);
+      if (targetTrack) {
+        targetTrack.classList.remove('drag-over');
+        targetTrackIndex = parseInt(targetTrack.dataset.trackIndex || targetTrack.id.replace('track-', ''), 10);
+      }
 
-    function onMainResize(e) {
-      const dx = e.clientX - startX;
-      const dt = dx / state.pixelPerSecond;
+      const fromClips = state.timeline.tracks[String(sourceTrackIndex)];
 
-      if (side === 'left') {
-        const newIn = Math.max(0, Math.min(originalSourceIn + dt, originalSourceOut - 0.1));
-        clip.sourceIn = newIn;
+      if (targetTrackIndex === sourceTrackIndex) {
+        // Same track - check overlap
+        const overlap = fromClips.find((c) => {
+          if (c.id === clip.id) return false;
+          const otherStart = c.timelineStart || 0;
+          const otherEnd = otherStart + (c.sourceOut - c.sourceIn);
+          const clipEnd = clip.timelineStart + duration;
+          return clip.timelineStart < otherEnd && otherStart < clipEnd;
+        });
+        if (overlap) {
+          clip.timelineStart = originalStart;
+        }
+        fromClips.push(clip);
       } else {
-        const maxOut = media ? Math.min(originalSourceIn + 10, media.duration) : originalSourceOut + 10;
-        const newOut = Math.max(originalSourceIn + 0.1, Math.min(originalSourceOut + dt, maxOut));
-        clip.sourceOut = newOut;
+        // Different track
+        const toClips = state.timeline.tracks[String(targetTrackIndex)];
+        const overlap = toClips.find((c) => {
+          const otherStart = c.timelineStart || 0;
+          const otherEnd = otherStart + (c.sourceOut - c.sourceIn);
+          const clipEnd = clip.timelineStart + duration;
+          return clip.timelineStart < otherEnd && otherStart < clipEnd;
+        });
+
+        if (!overlap) {
+          clip.trackIndex = targetTrackIndex;
+          toClips.push(clip);
+        } else {
+          clip.timelineStart = originalStart;
+          fromClips.push(clip);
+        }
       }
 
       renderTimeline();
       renderCanvas();
     }
-
-    function onMainResizeEnd() {
-      document.removeEventListener('mousemove', onMainResize);
-      document.removeEventListener('mouseup', onMainResizeEnd);
-      recalcTotalDuration();
-    }
   }
 
-  // ======================== OVERLAY DRAG ========================
-  function startOverlayDrag(e, clip, trackIdx) {
-    const trackEl = document.getElementById(`overlay-track-${trackIdx}`);
-    const trackRect = trackEl.getBoundingClientRect();
-    const startX = e.clientX;
-    const startLeft = (clip.timelineStart || 0) * state.pixelPerSecond;
-    const originalStart = clip.timelineStart;
-    const duration = clip.sourceOut - clip.sourceIn;
-
-    document.addEventListener('mousemove', onOverlayDrag);
-    document.addEventListener('mouseup', onOverlayDragEnd);
-
-    function onOverlayDrag(e) {
-      const dx = e.clientX - startX;
-      const newLeft = startLeft + dx;
-      let newStart = Math.max(0, newLeft / state.pixelPerSecond);
-
-      // Check overlap with other clips in same track
-      const clips = state.timeline.overlayTracks[String(trackIdx)];
-      const overlap = clips.find((c) => {
-        if (c.id === clip.id) return false;
-        const otherStart = c.timelineStart || 0;
-        const otherDuration = c.sourceOut - c.sourceIn;
-        const newEnd = newStart + duration;
-        const otherEnd = otherStart + otherDuration;
-        return newStart < otherEnd && otherStart < newEnd;
-      });
-
-      if (!overlap) {
-        clip.timelineStart = newStart;
-        renderOverlayTracks();
-        renderCanvas();
-      }
-    }
-
-    function onOverlayDragEnd(e) {
-      document.removeEventListener('mousemove', onOverlayDrag);
-      document.removeEventListener('mouseup', onOverlayDragEnd);
-
-      // Snap back if overlap detected
-      const clips = state.timeline.overlayTracks[String(trackIdx)];
-      const overlap = clips.find((c) => c.id !== clip.id && Math.abs(c.timelineStart - originalStart) < duration * 0.1);
-      if (overlap) {
-        clip.timelineStart = originalStart;
-        renderOverlayTracks();
-      }
-    }
-  }
-
-  // ======================== OVERLAY RESIZE ========================
-  function startOverlayResize(e, clip, trackIdx, side) {
+  function startClipResize(e, clip, trackIndex, side) {
     const startX = e.clientX;
     const originalIn = clip.sourceIn;
     const originalOut = clip.sourceOut;
     const media = state.mediaLibrary.find((m) => m.id === clip.sourceId);
 
-    document.addEventListener('mousemove', onOverlayResize);
-    document.addEventListener('mouseup', onOverlayResizeEnd);
+    document.addEventListener('mousemove', onClipResize);
+    document.addEventListener('mouseup', onClipResizeEnd);
 
-    function onOverlayResize(e) {
+    function onClipResize(e) {
       const dx = e.clientX - startX;
       const dt = dx / state.pixelPerSecond;
 
@@ -531,118 +588,52 @@
         clip.sourceOut = newOut;
       }
 
-      renderOverlayTracks();
+      renderTimeline();
       renderCanvas();
     }
 
-    function onOverlayResizeEnd() {
-      document.removeEventListener('mousemove', onOverlayResize);
-      document.removeEventListener('mouseup', onOverlayResizeEnd);
-    }
-  }
-
-  // ======================== OVERLAY CROSS-TRACK DRAG ========================
-  function setupOverlayCrossTrack() {
-    for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
-      const trackEl = document.getElementById(`overlay-track-${trackIdx}`);
-      if (!trackEl) continue;
-
-      trackEl.addEventListener('dragover', (e) => {
-        e.preventDefault();
-      });
-
-      trackEl.addEventListener('drop', (e) => {
-        e.preventDefault();
-        const clipId = e.dataTransfer.getData('clipId');
-        const sourceTrack = parseInt(e.dataTransfer.getData('sourceTrack'), 10);
-
-        if (!clipId || isNaN(sourceTrack)) return;
-
-        // Find the clip
-        const clips = state.timeline.overlayTracks[String(sourceTrack)];
-        if (!clips) return;
-        const clip = clips.find((c) => c.id === clipId);
-        if (!clip) return;
-
-        // Don't allow moving to main track
-        if (trackIdx === 0) return;
-
-        // Don't allow moving to same track
-        if (sourceTrack === trackIdx) return;
-
-        // Remove from source track
-        const srcIndex = clips.indexOf(clip);
-        clips.splice(srcIndex, 1);
-
-        // Add to target track
-        clip.trackIndex = trackIdx;
-        state.timeline.overlayTracks[String(trackIdx)].push(clip);
-
-        renderTimeline();
-        renderCanvas();
-      });
+    function onClipResizeEnd() {
+      document.removeEventListener('mousemove', onClipResize);
+      document.removeEventListener('mouseup', onClipResizeEnd);
+      if (trackIndex === 0) recalcTotalDuration();
     }
   }
 
   // ======================== CLIP SPLIT ========================
   function splitClipAtPlayhead() {
-    // Split main track clips
-    const clips = state.timeline.mainTrack;
-    for (let i = 0; i < clips.length; i++) {
-      const clip = clips[i];
-      const cumulativeStart = getCumulativeTime(clips, i);
-      const cumulativeEnd = cumulativeStart + (clip.sourceOut - clip.sourceIn);
+    for (let trackIndex = 0; trackIndex <= 3; trackIndex++) {
+      const clips = state.timeline.tracks[String(trackIndex)];
+      for (let i = 0; i < clips.length; i++) {
+        const clip = clips[i];
+        const clipStart = clip.timelineStart || 0;
+        const clipEnd = clipStart + (clip.sourceOut - clip.sourceIn);
 
-      if (state.playhead > cumulativeStart && state.playhead < cumulativeEnd) {
-        const splitTimeInClip = state.playhead - cumulativeStart;
-        const splitSourceTime = clip.sourceIn + splitTimeInClip;
-
-        const newClip = {
-          id: 'clip_' + crypto.randomUUID().replace(/-/g, ''),
-          sourceId: clip.sourceId,
-          type: 'video',
-          sourceIn: splitSourceTime,
-          sourceOut: clip.sourceOut,
-          trackIndex: 0,
-        };
-
-        clip.sourceOut = splitSourceTime;
-        clips.splice(i + 1, 0, newClip);
-        recalcTotalDuration();
-        renderTimeline();
-        renderCanvas();
-        return;
-      }
-    }
-
-    // Split overlay track clips
-    for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
-      const oClips = state.timeline.overlayTracks[String(trackIdx)];
-      for (const oClip of oClips) {
-        if (
-          state.playhead > oClip.timelineStart &&
-          state.playhead < oClip.timelineStart + (oClip.sourceOut - oClip.sourceIn)
-        ) {
-          const splitTimeInClip = state.playhead - oClip.timelineStart;
-          const splitSourceTime = oClip.sourceIn + splitTimeInClip;
+        if (state.playhead > clipStart && state.playhead < clipEnd) {
+          const splitTimeInClip = state.playhead - clipStart;
+          const splitSourceTime = clip.sourceIn + splitTimeInClip;
 
           const newClip = {
             id: 'clip_' + crypto.randomUUID().replace(/-/g, ''),
-            sourceId: oClip.sourceId,
+            sourceId: clip.sourceId,
+            type: clip.type || 'video',
             sourceIn: splitSourceTime,
-            sourceOut: oClip.sourceOut,
-            trackIndex: trackIdx,
-            timelineStart: oClip.timelineStart + splitTimeInClip,
-            x: oClip.x,
-            y: oClip.y,
-            width: oClip.width,
-            height: oClip.height,
-            opacity: oClip.opacity,
+            sourceOut: clip.sourceOut,
+            timelineStart: clipStart + splitTimeInClip,
+            trackIndex: trackIndex,
           };
 
-          oClip.sourceOut = splitSourceTime;
-          const idx = oClips.indexOf(oClip);
-          oClips.splice(idx + 1, 0, newClip);
+          if (clip.type === 'video') {
+            newClip.x = clip.x;
+            newClip.y = clip.y;
+            newClip.width = clip.width;
+            newClip.height = clip.height;
+            newClip.opacity = clip.opacity;
+          }
+
+          clip.sourceOut = splitSourceTime;
+          clips.splice(i + 1, 0, newClip);
+
+          if (trackIndex === 0) recalcTotalDuration();
           renderTimeline();
           renderCanvas();
           return;
@@ -651,33 +642,14 @@
     }
   }
 
-  function getCumulativeTime(clips, index) {
-    let time = 0;
-    for (let i = 0; i < index; i++) {
-      time += clips[i].sourceOut - clips[i].sourceIn;
-    }
-    return time;
-  }
-
   // ======================== DELETE CLIP ========================
   function deleteClip(clip) {
-    // Main track
-    const mainIdx = state.timeline.mainTrack.indexOf(clip);
-    if (mainIdx !== -1) {
-      state.timeline.mainTrack.splice(mainIdx, 1);
-      recalcTotalDuration();
-      renderTimeline();
-      renderCanvas();
-      clearSelection();
-      return;
-    }
-
-    // Overlay tracks
-    for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
-      const clips = state.timeline.overlayTracks[String(trackIdx)];
+    for (let trackIndex = 0; trackIndex <= 3; trackIndex++) {
+      const clips = state.timeline.tracks[String(trackIndex)];
       const idx = clips.indexOf(clip);
       if (idx !== -1) {
         clips.splice(idx, 1);
+        if (trackIndex === 0) recalcTotalDuration();
         renderTimeline();
         renderCanvas();
         clearSelection();
@@ -687,84 +659,103 @@
   }
 
   // ======================== CANVAS PREVIEW ========================
+  let pendingRender = false;
+  let pendingPlayhead = 0;
+
   function renderCanvas() {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (pendingRender) return;
+    pendingRender = true;
+    pendingPlayhead = state.playhead;
 
-    const { mainTrack, overlayTracks } = state.timeline;
-    const playheadTime = state.playhead;
+    requestAnimationFrame(() => {
+      pendingRender = false;
+      doRenderCanvas(pendingPlayhead);
+    });
+  }
 
-    // Draw main track clips at playhead position
-    let cumulativeTime = 0;
-    for (const clip of mainTrack) {
-      const clipStart = cumulativeTime;
-      const clipEnd = cumulativeTime + (clip.sourceOut - clip.sourceIn);
+  function doRenderCanvas(playheadTime) {
+    let anyClipReady = false;
 
-      if (playheadTime >= clipStart && playheadTime < clipEnd) {
-        const media = state.mediaLibrary.find((m) => m.id === clip.sourceId);
-        if (media) {
-          const videoEl = getVideoElement(clip.sourceId);
-          if (videoEl && videoEl.readyState >= 2) {
-            const clipLocalTime = playheadTime - clipStart;
-            const sourceTime = clip.sourceIn + clipLocalTime;
-
-            // Calculate scale to fit canvas
-            const scale = Math.min(
-              canvas.width / media.width,
-              canvas.height / media.height
-            );
-            const w = media.width * scale;
-            const h = media.height * scale;
-            const x = (canvas.width - w) / 2;
-            const y = (canvas.height - h) / 2;
-
-            ctx.drawImage(videoEl, x, y, w, h);
-          }
-        }
-      }
-
-      cumulativeTime = clipEnd;
-    }
-
-    // Draw overlay tracks (track 1 -> 2 -> 3, low to high z-order)
-    for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
-      const clips = overlayTracks[String(trackIdx)];
-      if (!clips || clips.length === 0) continue;
-
+    // Draw all tracks in order (0 -> 1 -> 2 -> 3)
+    for (let trackIndex = 0; trackIndex <= 3; trackIndex++) {
+      const clips = state.timeline.tracks[String(trackIndex)];
       for (const clip of clips) {
-        const clipDuration = clip.sourceOut - clip.sourceIn;
-        const clipStart = clip.timelineStart;
-        const clipEnd = clipStart + clipDuration;
+        const clipStart = clip.timelineStart || 0;
+        const clipEnd = clipStart + (clip.sourceOut - clip.sourceIn);
 
         if (playheadTime >= clipStart && playheadTime < clipEnd) {
           const media = state.mediaLibrary.find((m) => m.id === clip.sourceId);
           if (media) {
-            const videoEl = getVideoElement(clip.sourceId);
-            if (videoEl && videoEl.readyState >= 2) {
-              const clipLocalTime = playheadTime - clipStart;
-              const sourceTime = clip.sourceIn + clipLocalTime;
+            if (clip.type === 'audio') {
+              // For audio-only, show a placeholder
+              offCtx.fillStyle = '#1e293b';
+              offCtx.fillRect(0, 0, offscreen.width, offscreen.height);
+              offCtx.fillStyle = '#94a3b8';
+              offCtx.font = '20px sans-serif';
+              offCtx.textAlign = 'center';
+              offCtx.fillText('🎵 Audio Only', offscreen.width / 2, offscreen.height / 2);
+              anyClipReady = true;
+            } else if (media.contentType && media.contentType.startsWith('image/')) {
+              // Image clip
+              const img = getImageElement(clip.sourceId);
+              if (img && img.complete && img.naturalWidth > 0) {
+                let w, h, x, y;
+                if (trackIndex === 0) {
+                  w = offscreen.width;
+                  h = offscreen.height;
+                  x = 0;
+                  y = 0;
+                } else {
+                  w = clip.width || media.width || offscreen.width;
+                  h = clip.height || media.height || offscreen.height;
+                  x = clip.x !== undefined ? clip.x : (offscreen.width - w) / 2;
+                  y = clip.y !== undefined ? clip.y : (offscreen.height - h) / 2;
+                }
 
-              // Seek video to correct position
-              if (Math.abs(videoEl.currentTime - sourceTime) > 0.1) {
-                videoEl.currentTime = sourceTime;
+                const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
+                offCtx.globalAlpha = opacity;
+                offCtx.drawImage(img, x, y, w, h);
+                offCtx.globalAlpha = 1.0;
+                anyClipReady = true;
               }
+            } else {
+              // Video clip
+              const videoEl = getVideoElement(clip.sourceId);
+              if (videoEl && videoEl.readyState >= 2) {
+                const clipLocalTime = playheadTime - clipStart;
+                const sourceTime = clip.sourceIn + clipLocalTime;
 
-              const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
-              ctx.globalAlpha = opacity;
-              ctx.drawImage(
-                videoEl,
-                clip.x || 0,
-                clip.y || 0,
-                clip.width || 320,
-                clip.height || 180
-              );
-              ctx.globalAlpha = 1.0;
+                if (Math.abs(videoEl.currentTime - sourceTime) > 0.1) {
+                  videoEl.currentTime = sourceTime;
+                }
+
+                let w, h, x, y;
+                if (trackIndex === 0) {
+                  w = offscreen.width;
+                  h = offscreen.height;
+                  x = 0;
+                  y = 0;
+                } else {
+                  w = clip.width || media.width || offscreen.width;
+                  h = clip.height || media.height || offscreen.height;
+                  x = clip.x !== undefined ? clip.x : (offscreen.width - w) / 2;
+                  y = clip.y !== undefined ? clip.y : (offscreen.height - h) / 2;
+                }
+
+                const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
+                offCtx.globalAlpha = opacity;
+                offCtx.drawImage(videoEl, x, y, w, h);
+                offCtx.globalAlpha = 1.0;
+                anyClipReady = true;
+              }
             }
           }
         }
       }
     }
+
+    // Copy offscreen canvas to visible canvas in one operation
+    ctx.drawImage(offscreen, 0, 0);
   }
 
   // Hidden video elements pool
@@ -785,6 +776,29 @@
 
     videoPool.set(mediaId, video);
     return video;
+  }
+
+  // Hidden image elements pool
+  const imagePool = new Map();
+
+  function getImageElement(mediaId) {
+    if (imagePool.has(mediaId)) {
+      return imagePool.get(mediaId);
+    }
+
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    
+    img.onload = () => {
+      renderCanvas();
+    };
+    
+    img.src = `/api/media/${mediaId}/stream`;
+    img.style.display = 'none';
+    document.body.appendChild(img);
+
+    imagePool.set(mediaId, img);
+    return img;
   }
 
   // ======================== PLAYBACK ========================
@@ -825,26 +839,16 @@
     state.animFrameId = requestAnimationFrame(playLoop);
   }
 
-  // ======================== CANVAS SCRUB ========================
-  function setupCanvasScrub() {
-    canvas.addEventListener('click', (e) => {
-      const rect = canvas.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-
-      // Map canvas position to timeline time
-      const time = (x / canvas.width) * state.totalDuration;
-
-      state.playhead = Math.max(0, time);
-      renderCanvas();
-      renderTimeline();
-    });
-  }
+  // ======================== SPLIT ========================
+  splitBtn.addEventListener('click', () => {
+    if (state.timeline.tracks['0'].length === 0) return;
+    splitClipAtPlayhead();
+  });
 
   // ======================== EXPORT ========================
   exportBtn.addEventListener('click', async () => {
-    const { mainTrack } = state.timeline;
-    if (!mainTrack || mainTrack.length === 0) {
+    const mainClips = state.timeline.tracks['0'];
+    if (!mainClips || mainClips.length === 0) {
       exportStatus.textContent = 'No clips in timeline';
       return;
     }
@@ -852,11 +856,17 @@
     exportBtn.disabled = true;
     exportStatus.textContent = 'Starting export...';
 
+    // Add duration to timeline for backend
+    const timelineData = {
+      ...state.timeline,
+      duration: mainClips.reduce((s, c) => s + ((c.sourceOut || 0) - (c.sourceIn || 0)), 0),
+    };
+
     try {
       const resp = await fetch('/api/export', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(state.timeline),
+        body: JSON.stringify(timelineData),
       });
 
       if (resp.status === 400) {
@@ -940,9 +950,8 @@
 
   // ======================== INIT ========================
   function init() {
+    loadMediaLibrary();
     setupTracks();
-    setupOverlayCrossTrack();
-    setupCanvasScrub();
     renderTimeline();
     renderCanvas();
 

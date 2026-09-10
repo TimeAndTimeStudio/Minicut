@@ -33,7 +33,20 @@ const MIME_TYPES = {
   '.txt': 'text/plain',
 };
 
-const ALLOWED_EXTENSIONS = new Set(['.mp4', '.mov', '.webm', '.mkv']);
+const ALLOWED_EXTENSIONS = new Set([
+  '.mp4', '.mov', '.webm', '.mkv',
+  '.mp3', '.m4a', '.wav', '.ogg', '.flac', '.aac', '.opus'
+]);
+
+const CONTENT_TYPE_MAP = {
+  '.mp3': 'audio/mpeg',
+  '.m4a': 'audio/mp4',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.flac': 'audio/flac',
+  '.aac': 'audio/aac',
+  '.opus': 'audio/opus'
+};
 
 function serveStaticFile(res, filePath) {
   const extname = path.extname(filePath).toLowerCase();
@@ -345,25 +358,34 @@ function buildInputArgs(mediaList, mediaStore) {
   return { args, inputIndexMap };
 }
 
-function buildMainFilter(mainTrack, inputIndexMap) {
+function buildTrackFilter(clips, inputIndexMap, trackIndex) {
   const filterLines = [];
   const videoLabels = [];
   const audioLabels = [];
 
-  mainTrack.forEach((clip, i) => {
+  clips.forEach((clip, i) => {
     const inputIndex = inputIndexMap.get(clip.sourceId);
     const sourceIn = clip.sourceIn || 0;
     const sourceOut = clip.sourceOut;
+    const media = MEDIA_STORE.get(clip.sourceId);
 
-    filterLines.push(
-      `[${inputIndex}:v]trim=start=${sourceIn}:end=${sourceOut},setpts=PTS-STARTPTS[v${i}]`
-    );
-    filterLines.push(
-      `[${inputIndex}:a]atrim=start=${sourceIn}:end=${sourceOut},asetpts=PTS-STARTPTS[a${i}]`
-    );
-
-    videoLabels.push(`[v${i}]`);
-    audioLabels.push(`[a${i}]`);
+    if (clip.type === 'audio' || (!media?.hasVideo)) {
+      // Audio-only clip
+      filterLines.push(
+        `[${inputIndex}:a]atrim=start=${sourceIn}:end=${sourceOut},asetpts=PTS-STARTPTS[a${trackIndex}_${i}]`
+      );
+      audioLabels.push(`[a${trackIndex}_${i}]`);
+    } else {
+      // Video clip (with audio)
+      filterLines.push(
+        `[${inputIndex}:v]trim=start=${sourceIn}:end=${sourceOut},setpts=PTS-STARTPTS[v${trackIndex}_${i}]`
+      );
+      filterLines.push(
+        `[${inputIndex}:a]atrim=start=${sourceIn}:end=${sourceOut},asetpts=PTS-STARTPTS[a${trackIndex}_${i}]`
+      );
+      videoLabels.push(`[v${trackIndex}_${i}]`);
+      audioLabels.push(`[a${trackIndex}_${i}]`);
+    }
   });
 
   return { filterLines, videoLabels, audioLabels };
@@ -378,7 +400,13 @@ function buildConcatFilter(videoLabels, audioLabels) {
     return { filterLines: [], outVideo: videoLabels[0], outAudio: audioLabels[0] };
   }
 
-  const concatInputs = videoLabels.concat(audioLabels).join('');
+  // Interleave video and audio inputs: v0 a0 v1 a1 ... vn an
+  const interleaved = [];
+  for (let i = 0; i < numClips; i++) {
+    interleaved.push(videoLabels[i]);
+    interleaved.push(audioLabels[i]);
+  }
+  const concatInputs = interleaved.join('');
   filterLines.push(
     `${concatInputs}concat=n=${numClips}:v=1:a=1[outv][outa]`
   );
@@ -391,9 +419,8 @@ function buildOutputArgs(timeline, outVideo = '[outv]', outAudio = '[outa]') {
   return [
     '-map', outVideo,
     '-map', outAudio,
-    '-c:v', 'libx264',
-    '-preset', 'veryfast',
-    '-crf', '23',
+    '-c:v', 'mpeg4',
+    '-q:v', '8',
     '-c:a', 'aac',
     '-b:a', '128k',
     '-r', String(fps),
@@ -403,14 +430,14 @@ function buildOutputArgs(timeline, outVideo = '[outv]', outAudio = '[outa]') {
 
 function validateTimeline(timeline, mediaStore) {
   const errors = [];
-  const { mainTrack, overlayTracks, outputWidth, outputHeight } = timeline;
+  const { tracks, outputWidth, outputHeight } = timeline;
 
-  if (!mainTrack || mainTrack.length === 0) {
-    errors.push('mainTrack must have at least 1 clip');
+  if (!tracks || !tracks['0'] || tracks['0'].length === 0) {
+    errors.push('tracks["0"] must have at least 1 clip');
   }
 
-  if (!overlayTracks || !overlayTracks['1'] || !overlayTracks['2'] || !overlayTracks['3']) {
-    errors.push('overlayTracks must have keys "1", "2", "3"');
+  if (!tracks || !tracks['1'] || !tracks['2'] || !tracks['3']) {
+    errors.push('tracks must have keys "1", "2", "3"');
   }
 
   if (!Number.isFinite(outputWidth) || outputWidth <= 0 || outputWidth % 2 !== 0) {
@@ -420,61 +447,60 @@ function validateTimeline(timeline, mediaStore) {
     errors.push('outputHeight must be a positive even number');
   }
 
-  for (const clip of mainTrack) {
-    const media = mediaStore.get(clip.sourceId);
-    if (!media) {
-      errors.push(`main clip ${clip.id}: sourceId '${clip.sourceId}' not found`);
-      continue;
-    }
-    if (clip.sourceIn >= clip.sourceOut) {
-      errors.push(`main clip ${clip.id}: sourceIn (${clip.sourceIn}) >= sourceOut (${clip.sourceOut})`);
-    }
-    if (clip.sourceOut > media.duration) {
-      errors.push(`main clip ${clip.id}: sourceOut (${clip.sourceOut}) > media duration (${media.duration})`);
-    }
-    if (!media.hasVideo || !media.hasAudio) {
-      errors.push(`main clip ${clip.id}: source media must have both video and audio`);
-    }
-  }
-
-  const totalDuration = mainTrack.reduce((sum, clip) => {
+  const totalDuration = tracks['0'].reduce((sum, clip) => {
     return sum + ((clip.sourceOut || 0) - (clip.sourceIn || 0));
   }, 0);
 
+  for (const clip of tracks['0']) {
+    const media = mediaStore.get(clip.sourceId);
+    if (!media) {
+      errors.push(`track 0 clip ${clip.id}: sourceId '${clip.sourceId}' not found`);
+      continue;
+    }
+    if (clip.sourceIn >= clip.sourceOut) {
+      errors.push(`track 0 clip ${clip.id}: sourceIn (${clip.sourceIn}) >= sourceOut (${clip.sourceOut})`);
+    }
+    if (clip.sourceOut > media.duration) {
+      errors.push(`track 0 clip ${clip.id}: sourceOut (${clip.sourceOut}) > media duration (${media.duration})`);
+    }
+    if (clip.type === 'video' && (!media.hasVideo || !media.hasAudio)) {
+      errors.push(`track 0 clip ${clip.id}: source media must have both video and audio`);
+    }
+  }
+
   for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
-    const clips = overlayTracks[String(trackIdx)];
+    const clips = tracks[String(trackIdx)];
     if (!clips || clips.length === 0) continue;
 
     for (const clip of clips) {
       const media = mediaStore.get(clip.sourceId);
       if (!media) {
-        errors.push(`overlay clip ${clip.id} (track ${trackIdx}): sourceId '${clip.sourceId}' not found`);
+        errors.push(`track ${trackIdx} clip ${clip.id}: sourceId '${clip.sourceId}' not found`);
         continue;
       }
 
       const duration = clip.sourceOut - (clip.sourceIn || 0);
       const end = (clip.timelineStart || 0) + duration;
 
-      if (clip.trackIndex !== undefined && (clip.trackIndex < 1 || clip.trackIndex > 3)) {
-        errors.push(`overlay clip ${clip.id}: trackIndex must be 1, 2, or 3`);
-      }
-
       if (duration <= 0) {
-        errors.push(`overlay clip ${clip.id}: duration must be positive`);
+        errors.push(`track ${trackIdx} clip ${clip.id}: duration must be positive`);
       }
       if (duration > media.duration) {
-        errors.push(`overlay clip ${clip.id}: duration (${duration}) > media duration (${media.duration})`);
+        errors.push(`track ${trackIdx} clip ${clip.id}: duration (${duration}) > media duration (${media.duration})`);
       }
       if (end > totalDuration) {
-        errors.push(`overlay clip ${clip.id}: timelineStart + duration (${end}) > total duration (${totalDuration})`);
-      }
-      if (clip.x + clip.width > outputWidth || clip.y + clip.height > outputHeight) {
-        errors.push(`overlay clip ${clip.id}: position + size exceeds output dimensions`);
+        errors.push(`track ${trackIdx} clip ${clip.id}: timelineStart + duration (${end}) > total duration (${totalDuration})`);
       }
 
-      const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
-      if (opacity < 0.0 || opacity > 1.0) {
-        errors.push(`overlay clip ${clip.id}: opacity must be between 0.0 and 1.0`);
+      if (clip.type === 'video') {
+        if (clip.x + clip.width > outputWidth || clip.y + clip.height > outputHeight) {
+          errors.push(`track ${trackIdx} clip ${clip.id}: position + size exceeds output dimensions`);
+        }
+
+        const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
+        if (opacity < 0.0 || opacity > 1.0) {
+          errors.push(`track ${trackIdx} clip ${clip.id}: opacity must be between 0.0 and 1.0`);
+        }
       }
 
       for (const other of clips) {
@@ -484,7 +510,7 @@ function validateTimeline(timeline, mediaStore) {
         const clipStart = clip.timelineStart || 0;
         const clipEnd = clipStart + duration;
         if (clipStart < otherEnd && clipEnd > otherStart) {
-          errors.push(`overlay clips ${clip.id} and ${other.id} overlap in track ${trackIdx}`);
+          errors.push(`tracks[${trackIdx}] clips ${clip.id} and ${other.id} overlap`);
         }
       }
     }
@@ -502,80 +528,116 @@ async function runExportJob(jobId, timeline) {
   saveExportJob(job);
 
   try {
-    const { mainTrack, overlayTracks, outputWidth, outputHeight, fps } = timeline;
-    const allMediaIds = [...new Set([...mainTrack.map(c => c.sourceId)])];
+    const { tracks, outputWidth, outputHeight, fps } = timeline;
+    const mainClips = tracks['0'] || [];
+    const totalDuration = mainClips.reduce((s, c) => s + ((c.sourceOut || 0) - (c.sourceIn || 0)), 0);
 
-    for (let t = 1; t <= 3; t++) {
-      const clips = overlayTracks[String(t)];
-      if (clips && clips.length > 0) {
-        clips.forEach(c => {
-          if (!allMediaIds.includes(c.sourceId)) allMediaIds.push(c.sourceId);
-        });
+    // Collect all media IDs
+    const allMediaIds = new Set();
+    for (let t = 0; t <= 3; t++) {
+      const clips = tracks[String(t)];
+      if (clips) clips.forEach(c => allMediaIds.add(c.sourceId));
+    }
+    const mediaIdArray = [...allMediaIds];
+
+    const { args: inputArgs, inputIndexMap } = buildInputArgs(mediaIdArray, MEDIA_STORE);
+    const filterLines = [];
+
+    // Build filters for each track
+    const trackResults = {};
+    for (let trackIdx = 0; trackIdx <= 3; trackIdx++) {
+      const clips = tracks[String(trackIdx)];
+      if (!clips || clips.length === 0) {
+        trackResults[String(trackIdx)] = { videoLabels: [], audioLabels: [] };
+        continue;
       }
+      trackResults[String(trackIdx)] = buildTrackFilter(clips, inputIndexMap, trackIdx);
     }
 
-    const { args: inputArgs, inputIndexMap } = buildInputArgs(allMediaIds, MEDIA_STORE);
-    const mainResult = buildMainFilter(mainTrack, inputIndexMap);
+    // Start with track 0 (main track)
+    let outVideo = trackResults['0'].videoLabels[trackResults['0'].videoLabels.length - 1] || null;
+    let outAudio = trackResults['0'].audioLabels[trackResults['0'].audioLabels.length - 1] || null;
+    filterLines.push(...trackResults['0'].filterLines);
 
-    const hasOverlays = [1, 2, 3].some(t => {
-      const clips = overlayTracks[String(t)];
-      return clips && clips.length > 0;
-    });
+    // Concatenate main track clips if multiple
+    if (trackResults['0'].videoLabels.length > 1 || trackResults['0'].audioLabels.length > 1) {
+      const videoLabels = trackResults['0'].videoLabels.filter(l => l);
+      const audioLabels = trackResults['0'].audioLabels.filter(l => l);
+      if (videoLabels.length > 0 && audioLabels.length > 0) {
+        const concatResult = buildConcatFilter(videoLabels, audioLabels);
+        filterLines.push(...concatResult.filterLines);
+        outVideo = concatResult.outVideo;
+        outAudio = concatResult.outAudio;
+      }
+    } else if (trackResults['0'].videoLabels.length === 1 && trackResults['0'].audioLabels.length === 1) {
+      outVideo = trackResults['0'].videoLabels[0];
+      outAudio = trackResults['0'].audioLabels[0];
+    }
 
-    let filterLines = [...mainResult.filterLines];
-    let outVideo = mainResult.videoLabels[mainResult.videoLabels.length - 1] || '[v0]';
-    let outAudio = mainResult.audioLabels[mainResult.audioLabels.length - 1] || '[a0]';
+    // Process overlay tracks (1, 2, 3)
+    for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
+      const clips = tracks[String(trackIdx)];
+      if (!clips || clips.length === 0) continue;
 
-    if (!hasOverlays) {
-      const concatResult = buildConcatFilter(mainResult.videoLabels, mainResult.audioLabels);
-      filterLines.push(...concatResult.filterLines);
-      outVideo = concatResult.outVideo;
-      outAudio = concatResult.outAudio;
-    } else {
-      const totalDuration = mainTrack.reduce((s, c) => s + ((c.sourceOut || 0) - (c.sourceIn || 0)), 0);
-      const concatResult = buildConcatFilter(mainResult.videoLabels, mainResult.audioLabels);
-      filterLines.push(...concatResult.filterLines);
-      outVideo = concatResult.outVideo;
-      outAudio = concatResult.outAudio;
+      // Concatenate clips in this overlay track
+      let trackOutVideo = null;
+      if (clips.length > 1) {
+        const videoLabels = trackResults[String(trackIdx)].videoLabels.filter(l => l);
+        const audioLabels = trackResults[String(trackIdx)].audioLabels.filter(l => l);
+        if (videoLabels.length > 0 && audioLabels.length > 0) {
+          const concatResult = buildConcatFilter(videoLabels, audioLabels);
+          filterLines.push(...concatResult.filterLines);
+          trackOutVideo = concatResult.outVideo;
+        }
+      } else if (trackResults[String(trackIdx)].videoLabels.length === 1) {
+        trackOutVideo = trackResults[String(trackIdx)].videoLabels[0];
+      }
 
-      for (let trackIdx = 1; trackIdx <= 3; trackIdx++) {
-        const clips = overlayTracks[String(trackIdx)];
-        if (!clips || clips.length === 0) continue;
+      if (!trackOutVideo) continue;
 
-        for (let clipIdx = 0; clipIdx < clips.length; clipIdx++) {
-          const clip = clips[clipIdx];
-          const inputIndex = inputIndexMap.get(clip.sourceId);
-          const duration = clip.sourceOut - (clip.sourceIn || 0);
-          const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
-          const x = clip.x || 0;
-          const y = clip.y || 0;
-          const timelineStart = clip.timelineStart || 0;
-          const end = timelineStart + duration;
+      // Apply overlay for each clip in this track
+      for (let clipIdx = 0; clipIdx < clips.length; clipIdx++) {
+        const clip = clips[clipIdx];
+        const duration = clip.sourceOut - (clip.sourceIn || 0);
+        const opacity = clip.opacity !== undefined ? clip.opacity : 1.0;
+        const x = clip.x || 0;
+        const y = clip.y || 0;
+        const timelineStart = clip.timelineStart || 0;
+        const end = timelineStart + duration;
 
-          const ovLabel = `ov${trackIdx}_${clipIdx}`;
-          const ovFmtLabel = `ov${trackIdx}_${clipIdx}_fmt`;
+        const ovLabel = `ov${trackIdx}_${clipIdx}`;
+        const ovFmtLabel = `ov${trackIdx}_${clipIdx}_fmt`;
 
-          filterLines.push(
-            `[${inputIndex}:v]trim=start=${clip.sourceIn || 0}:end=${clip.sourceOut},setpts=PTS-STARTPTS[${ovLabel}]`
-          );
-          filterLines.push(
-            `[${ovLabel}]format=rgba,colorchannelmixer=aa=${opacity}[${ovFmtLabel}]`
-          );
+        filterLines.push(
+          `[${trackOutVideo}]format=rgba,colorchannelmixer=aa=${opacity}[${ovFmtLabel}]`
+        );
 
-          let overlayInput = `[${ovFmtLabel}]`;
-          if (clipIdx === 0) {
-            overlayInput = `[${outVideo}][${ovFmtLabel}]`;
-          }
-
-          const outLabel = clipIdx < clips.length - 1 ? `[ov${trackIdx}_${clipIdx}]` : `[ov${trackIdx}]`;
-          filterLines.push(
-            `[${overlayInput}]overlay=enable='between(t,${timelineStart},${end})':x=${x}:y=${y}${outLabel}`
-          );
+        let overlayInput = `[${ovFmtLabel}]`;
+        if (clipIdx === 0) {
+          overlayInput = `[${outVideo}][${ovFmtLabel}]`;
         }
 
-        const lastOvLabel = clips.length === 1 ? `[ov${trackIdx}_0]` : `[ov${trackIdx}]`;
-        outVideo = lastOvLabel;
+        const outLabel = clipIdx < clips.length - 1 ? `[ov${trackIdx}_${clipIdx}]` : `[ov${trackIdx}]`;
+        filterLines.push(
+          `[${overlayInput}]overlay=enable='between(t,${timelineStart},${end})':x=${x}:y=${y}${outLabel}`
+        );
       }
+
+      const lastOvLabel = clips.length === 1 ? `[ov${trackIdx}_0]` : `[ov${trackIdx}]`;
+      outVideo = lastOvLabel;
+    }
+
+    // Handle audio-only case
+    if (!outAudio) {
+      // Create silent audio if no audio streams
+      filterLines.push(`anullsrc=cl=stereo:sample_rate=44100[silence]`);
+      outAudio = '[silence]';
+    }
+
+    // Handle video-only case (generate black frame)
+    if (!outVideo) {
+      filterLines.push(`color=c=black:s=1280x720:d=${totalDuration}:r=${fps || 30}[blackvideo]`);
+      outVideo = '[blackvideo]';
     }
 
     const outputArgs = buildOutputArgs(timeline, outVideo, outAudio);
@@ -615,7 +677,7 @@ async function runExportJob(jobId, timeline) {
       const timeMatch = str.match(/time=(\d+):(\d+):(\d+\.\d+)/);
       if (timeMatch) {
         const secs = parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseFloat(timeMatch[3]);
-        job.progress = Math.min(secs / (timeline.duration || 60), 1.0);
+        job.progress = Math.min(secs / (totalDuration || 60), 1.0);
         saveExportJob(job);
       }
     });
@@ -714,6 +776,7 @@ const server = http.createServer(async (req, res) => {
           ...mediaInfo,
           id: mediaId,
           filename,
+          contentType: CONTENT_TYPE_MAP[ext] || mediaInfo.contentType || (mediaInfo.hasVideo ? 'video/mp4' : 'audio/mpeg'),
         };
 
         MEDIA_STORE.set(mediaId, mediaObject);
@@ -728,6 +791,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // GET /api/media (list all)
+    if (pathname === '/api/media' && req.method === 'GET') {
+      const mediaList = Array.from(MEDIA_STORE.values());
+      sendJson(res, 200, mediaList);
+      return;
+    }
+
     // GET /api/media/:id
     const mediaInfoMatch = pathname.match(/^\/api\/media\/([^/]+)$/);
     if (mediaInfoMatch && req.method === 'GET') {
@@ -738,6 +808,26 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       sendJson(res, 200, media);
+      return;
+    }
+
+    // DELETE /api/media/:id
+    const mediaDeleteMatch = pathname.match(/^\/api\/media\/([^/]+)$/);
+    if (mediaDeleteMatch && req.method === 'DELETE') {
+      const mediaId = mediaDeleteMatch[1];
+      const media = MEDIA_STORE.get(mediaId);
+      if (!media) {
+        sendJson(res, 404, { error: 'not_found', message: 'Media not found' });
+        return;
+      }
+      const filePath = path.join(UPLOAD_DIR, media.filename);
+      try {
+        await fsPromises.unlink(filePath);
+        MEDIA_STORE.delete(mediaId);
+        sendJson(res, 200, { success: true });
+      } catch (err) {
+        sendJson(res, 500, { error: 'delete_failed', message: err.message });
+      }
       return;
     }
 
@@ -923,6 +1013,31 @@ const server = http.createServer(async (req, res) => {
 async function start() {
   try {
     await Promise.all([ensureDir(UPLOAD_DIR), ensureDir(OUTPUT_DIR)]);
+    
+    // Load existing media files into MEDIA_STORE
+    const files = await fsPromises.readdir(UPLOAD_DIR);
+    for (const file of files) {
+      const ext = path.extname(file).toLowerCase();
+      if (!ALLOWED_EXTENSIONS.has(ext)) continue;
+      
+      const mediaId = file.replace(/\.[^.]+$/, '');
+      const filePath = path.join(UPLOAD_DIR, file);
+      
+      try {
+        const mediaInfo = await getMediaInfo(filePath);
+        const mediaObject = {
+          ...mediaInfo,
+          id: mediaId,
+          filename: file,
+          contentType: CONTENT_TYPE_MAP[ext] || mediaInfo.contentType || (mediaInfo.hasVideo ? 'video/mp4' : 'audio/mpeg'),
+        };
+        MEDIA_STORE.set(mediaId, mediaObject);
+        console.log(`Loaded media: ${mediaId} (${ext})`);
+      } catch (err) {
+        console.error(`Failed to load media ${file}:`, err.message);
+      }
+    }
+    console.log(`Loaded ${MEDIA_STORE.size} media files from ${UPLOAD_DIR}`);
   } catch (err) {
     console.error('Failed to create directories:', err.message);
   }
