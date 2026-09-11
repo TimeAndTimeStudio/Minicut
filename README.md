@@ -90,7 +90,7 @@ PORT=8080 node server.js
 ## Export Settings
 
 - **Container:** MP4
-- **Video:** libx264, preset `veryfast`, CRF 23
+- **Video:** mpeg4
 - **Audio:** AAC, 128kbps
 - **Default resolution:** 1280x720 @ 30fps
 
