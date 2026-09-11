@@ -96,4 +96,4 @@ PORT=8080 node server.js
 
 ## License
 
-MIT
+GNU General Public License v3 (GPLv3) — see `LICENSE` file
